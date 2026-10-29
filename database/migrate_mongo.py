@@ -37,6 +37,11 @@ def _all_uris(primary_db_doc_uris):
     return uris
 
 
+def _label(uri):
+    """Logs/report me password kabhi nahi - sirf host."""
+    return "mongo@" + (uri.split("@")[-1].split("/")[0].split("?")[0][:30] or "?")
+
+
 async def _push(loop, coro):
     return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, loop))
 
@@ -113,7 +118,7 @@ def _pull(uri, loop, report):
         if s:
             st = {k: s[k] for k in ("brand_name", "brand_link", "auto_approve_enabled", "approval_wait_time") if k in s}
             if st:
-                run(db.import_doc("settings", "global", st))
+                run(db.import_settings(st))
                 report["settings"] = 1
 
         # ---- join requests
@@ -167,10 +172,10 @@ async def run(force=False):
                 if u not in seen_uris and u not in queue:
                     queue.append(u)
         except Exception as e:      # noqa
-            failed.append(f"{uri[:22]}… → {type(e).__name__}")
-            print(f"mongo migrate error ({uri[:22]}): {type(e).__name__}: {e}")
+            failed.append(f"{_label(uri)} → {type(e).__name__}")
+            print(f"mongo migrate error ({_label(uri)}): {type(e).__name__}")
     await db.reload()
-    if done and not (config.DB_URI and any(config.DB_URI[:22] in f for f in failed)):
+    if done and not (config.DB_URI and any(_label(config.DB_URI) in f for f in failed)):
         await db.set_meta("mongo_migrated", int(time.time()))
         db.touch(True)
         flag = "✅ Mongo se data copy ho gaya (Mongo jaisa ka taisa safe hai)."

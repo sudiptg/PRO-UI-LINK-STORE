@@ -644,6 +644,17 @@ class DB:
         await self._run(_i)
         self.touch()
 
+    async def import_settings(self, st):
+        """Mongo settings: sirf wahi keys bharo jo abhi default/khali hain (jo owner ne badla wo safe rehta hai)."""
+        added = False
+        for k, v in st.items():
+            if k not in self.settings or self.settings[k] == DEFAULT_SETTINGS.get(k):   # abhi tak default hai
+                if self.settings.get(k) != v:
+                    self.settings[k] = v
+                    added = True
+        if added:
+            await self._doc_set("settings", "global", self.settings)
+
     async def import_genlink(self, gid, link, ts, alias_tokens=()):
         def _i(c):
             c.execute("INSERT OR IGNORE INTO genlinks(id, link, ts) VALUES(?,?,?)", (int(gid), link, int(ts or 0)))

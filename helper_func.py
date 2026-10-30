@@ -225,21 +225,21 @@ async def check_subscription_status(user_id, fsub_channels, payload=""):
     if not unjoined:
         return True, "", None
 
-    async def one(cid):
+    async def one(cid, n):
         try:
             mode = db.get_channel_mode(cid)
-            link, title = await get_fsub_invite_link(cid, mode)
-            return B(f"{'🔔' if mode == 'on' else '📢'} {title[:34]}", url=link)
+            link, _title = await get_fsub_invite_link(cid, mode)
+            return B(f"{sc('join channel')} {n}", url=link)
         except Exception:       # noqa
             return None
-    btns = [b for b in await asyncio.gather(*(one(c) for c in unjoined)) if b]
+    btns = [b for b in await asyncio.gather(*(one(c, i) for i, c in enumerate(unjoined, 1))) if b]
     if not btns:
         return True, "", None
-    rows = [[b] for b in btns]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]          # 2-2 ki jodi me (aakhri akeli ho sakti hai)
     if payload:
-        rows.append([B("♻️ " + sc("try again"), url=ui.deep_link(payload))])
+        rows.append([B("• " + sc("try again") + " •", url=ui.deep_link(payload))])
     else:
-        rows.append([B("✅ " + sc("i have joined"), cb="check_sub")])
+        rows.append([B("• " + sc("i have joined") + " •", cb="check_sub")])
     return False, "", rows
 
 

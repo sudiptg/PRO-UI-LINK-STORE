@@ -23,8 +23,16 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0") or "0")
 
 # 💾 DATA KA GHAR: ek PRIVATE Telegram channel (-100...). Bot ko usme admin banao
 # (Post Messages + Edit Messages + Pin Messages). Yahi tumhara database hai.
-_bk = os.environ.get("BACKUP_CHANNEL", "0").strip()
-BACKUP_CHANNEL = int(_bk) if id_pattern.search(_bk) else 0
+# Ek se zyada channel bhi laga sakte ho (har channel me poori copy = extra suraksha):
+#   BACKUP_CHANNEL = -1001111111111,-1002222222222      (comma se alag)   ya   BACKUP_CHANNEL_2 / BACKUP_CHANNEL_3 ... alag env me
+BACKUP_CHANNELS = []
+_bk_all = [os.environ.get("BACKUP_CHANNEL", "")] + [os.environ.get(f"BACKUP_CHANNEL_{i}", "") for i in range(2, 6)]
+for _chunk in _bk_all:
+    for _t in re.split(r"[,;\s]+", _chunk.strip()):
+        if id_pattern.search(_t) and int(_t) != 0 and int(_t) not in BACKUP_CHANNELS:
+            BACKUP_CHANNELS.append(int(_t))
+BACKUP_CHANNELS = BACKUP_CHANNELS[:5]
+BACKUP_CHANNEL = BACKUP_CHANNELS[0] if BACKUP_CHANNELS else 0      # (purane code ke liye: pehla channel)
 
 PORT = int(os.environ.get("PORT", "8080"))
 WEB_SERVER_URL = os.environ.get("WEB_SERVER_URL", os.environ.get("RENDER_EXTERNAL_URL", ""))

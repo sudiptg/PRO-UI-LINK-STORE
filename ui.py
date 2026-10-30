@@ -6,10 +6,12 @@
 - Ek hi scheduler (message delete / link revoke / approve) - har kaam ka alag task nahi => RAM bachta hai
 """
 import asyncio
+import contextvars
 import heapq
 import html
 import itertools
 import json
+import os
 import time
 
 import aiohttp
@@ -19,7 +21,13 @@ import config
 BASE = f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}/"
 FILE_BASE = f"https://api.telegram.org/file/bot{config.TG_BOT_TOKEN}/"
 RED = "danger"
-ME = {}                    # getMe ka result
+ME = {}
+
+# Admin panel par bhi photo: PANEL_PIC (na ho to START_PIC). Sirf admin ke buttons / input wale kaam me (ADMIN_MODE).
+PANEL_PIC = os.environ.get("PANEL_PIC", config.START_PIC or "")
+ADMIN_MODE = contextvars.ContextVar("admin_mode", default=False)
+_AUTO = object()
+CAPTION_MAX = 1000                    # getMe ka result
 
 esc = lambda s: html.escape(str(s), quote=False)       # noqa: E731
 
@@ -266,6 +274,8 @@ def plain(markup):
 
 def _style_error(e):
     """Sirf tab bina-rang keyboard bhejo jab Telegram rang (style) par hi aitraaz kare."""
+    if e.not_modified:          # "message is not modified ... reply markup are exactly the same" = style ka masla nahi
+        return False
     return e.code == 400 and any(t in e.low for t in ("style", "reply keyboard", "reply markup", "reply_markup"))
 
 
@@ -301,27 +311,40 @@ def has_media(msg):
 
 
 async def edit(chat_id, message_id, text, rows=None, caption=False):
-    params = dict(chat_id=chat_id, message_id=message_id, parse_mode="HTML")
-    if rows is not None:
-        params["reply_markup"] = KB(rows)
-    if caption:
-        params["caption"] = text
-        method = "editMessageCaption"
-    else:
-        params["text"] = text
-        params["link_preview_options"] = {"is_disabled": True}
-        method = "editMessageText"
-    try:
-        return await _try_style(method, params)
-    except TgError as e:
-        if e.not_modified:
-            return None
-        raise
+    """Text ya caption edit. Galat type ka guess ho (photo ko text samjha / ulta) to apne aap theek kar leta hai."""
+    for _try in (0, 1):
+        params = dict(chat_id=chat_id, message_id=message_id, parse_mode="HTML")
+        if rows is not None:
+            params["reply_markup"] = KB(rows)
+        if caption:
+            params["caption"] = text
+            method = "editMessageCaption"
+        else:
+            params["text"] = text
+            params["link_preview_options"] = {"is_disabled": True}
+            method = "editMessageText"
+        try:
+            return await _try_style(method, params)
+        except TgError as e:
+            if e.not_modified:
+                return None
+            if _try == 0 and e.code == 400 and "no text in the message to edit" in e.low:
+                caption = True                      # asal me photo wala message hai
+                continue
+            if _try == 0 and e.code == 400 and "no caption in the message to edit" in e.low:
+                caption = False
+                continue
+            raise
 
 
-async def show(msg, text, rows, photo=None):
+async def show(msg, text, rows, photo=_AUTO):
     """Panel dikhao. photo di ho to photo+caption (caption 1000 akshar tak), warna seedha text.
-    Photo wala message ho aur text chahiye (ya ulta) to purana hata kar naya bhejta hai."""
+    Photo wala message ho aur text chahiye (ya ulta) to purana hata kar naya bhejta hai.
+    photo na do to: admin kaam me PANEL_PIC lagti hai (text chhota ho tab), baaki jagah text."""
+    if photo is _AUTO:
+        photo = PANEL_PIC if (ADMIN_MODE.get() and PANEL_PIC and len(text) <= CAPTION_MAX) else None
+    elif photo and len(text) > CAPTION_MAX:
+        photo = None
     cid, mid = msg["chat"]["id"], msg["message_id"]
     try:
         if photo and has_media(msg):

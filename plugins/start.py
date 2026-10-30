@@ -254,9 +254,24 @@ async def cb_about(cb, parts):
     await ui.show(cb["message"], config.ABOUT_TXT + db.get_brand_footer(), _back_close(), photo=config.START_PIC or None)
 
 
+def _channel_rows():
+    """Admin ne jo channel buttons joode hain (2-2 ki jodi me) + Back / Close."""
+    items = db.get_setting("chan_btns", []) or []
+    btns = []
+    for i, x in enumerate(items, 1):
+        try:
+            name, url = str(x[0]), str(x[1])
+        except (IndexError, TypeError):
+            continue
+        btns.append(B(f"• {sc(name) if name else sc('join channel') + ' ' + str(i)} •", url=url))
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    return rows + _back_close()
+
+
 @route("channels")
 async def cb_channels(cb, parts):
-    await ui.show(cb["message"], config.CHANNELS_TXT + db.get_brand_footer(), _back_close(), photo=config.START_PIC or None)
+    text = config.CHANNELS_TXT + db.get_brand_footer()
+    await ui.show(cb["message"], text, _channel_rows(), photo=config.START_PIC or None)
 
 
 @route("close")

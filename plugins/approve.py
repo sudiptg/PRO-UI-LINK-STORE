@@ -1,5 +1,5 @@
 """
-✅ APPROVE - join request aate hi auto approve (timer ke saath), welcome DM, aur panel ke buttons.
+APPROVE - join request aate hi auto approve (timer ke saath), welcome DM, aur panel ke buttons.
 Handler ke andar kabhi sleep nahi hota: approve ka kaam scheduler me jaata hai => 1 lakh requests par bhi bot tez rehta hai.
 """
 import asyncio

@@ -14,8 +14,6 @@ from plugins import fsub
 from ui import B, TgError, lbl, esc
 
 _warn = {}                 # chat -> last owner warning ts
-_wlink = {}                # chat -> (link, expiry)
-_wlock = {}
 
 
 # ================================================================ join request aaya
@@ -66,29 +64,25 @@ async def _approve(cid, uid, uchat, first_name, title, username):
 ui.HANDLERS["approve"] = _approve
 
 
-async def _channel_link(cid, username):
+async def _channel_link(cid, username, expiry):
+    """Welcome ke button ka link. Private channel: EXPIRY wala invite link (permanent nahi); public: t.me/username.
+    -> (link, kitne second baad ye message hat jaye)"""
     if username:
-        return f"https://t.me/{username}"
-    hit = _wlink.get(cid)
-    if hit and time.time() < hit[1]:
-        return hit[0]
-    lock = _wlock.setdefault(cid, asyncio.Lock())
-    async with lock:
-        hit = _wlink.get(cid)
-        if hit and time.time() < hit[1]:
-            return hit[0]
-        try:
-            inv = await ui.api("createChatInviteLink", chat_id=cid, _retries=1)
-            _wlink[cid] = (inv["invite_link"], time.time() + 1800)
-            return inv["invite_link"]
-        except TgError:
-            _wlink[cid] = ("", time.time() + 300)
-            return ""
+        return f"https://t.me/{username}", expiry
+    from plugins import start as _start             # wahi link-reuse engine jo /start me hai
+    try:
+        link, exp = await _start.get_invite(cid, False)
+    except TgError:
+        return "", expiry
+    cached = db.get_current_invite_link(cid, False)
+    left = int(cached[1] + exp - time.time()) if cached and cached[0] == link else exp
+    return link, max(20, left)
 
 
 async def _welcome(cid, uid, uchat, first_name, title, username):
     try:
-        link = await _channel_link(cid, username)
+        expiry = db.get_link_expiry(cid)
+        link, delete_in = await _channel_link(cid, username, expiry)
         rows = []
         if link:
             rows.append([B(f"• ᴊᴏɪɴ {title[:26]} •", url=link)])
@@ -101,7 +95,9 @@ async def _welcome(cid, uid, uchat, first_name, title, username):
         except Exception:       # noqa
             caption = (f"<b>👋 ʜᴇʏ {mention},\n\n<blockquote>✅ ʏᴏᴜʀ ʀᴇǫᴜᴇsᴛ ᴛᴏ ᴊᴏɪɴ <b>{esc(title)}</b> "
                        f"ʜᴀs ʙᴇᴇɴ ᴀᴘᴘʀᴏᴠᴇᴅ!</blockquote></b>" + db.get_brand_footer())
-        await ui.send(uchat, caption, rows or None, photo=config.START_PIC or None)
+        sent = await ui.send(uchat, caption, rows or None, photo=config.START_PIC or None)
+        if isinstance(sent, dict) and sent.get("message_id"):
+            ui.schedule_delete(uchat, sent["message_id"], delete_in)      # link expire hote hi message bhi gayab
     except TgError:
         pass                                         # user ne DM band rakha - koi baat nahi
     except Exception as e:      # noqa

@@ -1,15 +1,21 @@
 """
-☁️ TGBACKUP - database ki copy tumhare PRIVATE Telegram channel me (yahi tumhara "database channel").
+☁️ TGBACKUP - database ki copy tumhare PRIVATE Telegram channel(s) me (yahi tumhara "database channel").
 
 Render free par disk restart / deploy par mit jati hai. Isliye:
   - Zaroori badlav (channel add, setting, admin...) ~10 sec me channel me save.
   - Chhote badlav (naye users, clicks) har BACKUP_EVERY sec me.
-  - DB ki compressed file channel me EK hi message me update hoti hai (naya message nahi banta) aur PIN rehta hai.
+  - DB ki compressed file har channel me EK hi message me update hoti hai (naya message nahi banta) aur PIN rehta hai.
+  - EK SE ZYADA channel (BACKUP_CHANNEL=-100a,-100b): har channel me poori copy. Ek channel ud jaye / bot hat jaye
+    to bhi doosre me data safe. Restore ke waqt sabse NAYA backup liya jata hai.
   - Bot start hote hi pinned backup dekhta hai aur local se naya ho to restore karta hai.
   - Band hone (deploy / restart) se pehle aakhri backup bhi leta hai.
 """
 import asyncio
+import gzip
+import os
 import re
+import sqlite3
+import tempfile
 import time
 
 import config
@@ -17,11 +23,36 @@ import ui
 from database.database import db, local_last_write, restore_file
 from ui import TgError
 
+# STATE: sabka saar (panel / main isi ko padhte hain)    CH: har channel ki apni halat
 STATE = {"msg_id": 0, "last": 0, "ok": None, "err": "", "size": 0, "verified": False}
+CH = {}
 MAX_BYTES = 19 * 1024 * 1024          # Bot API 20 MB se badi file download nahi karne deta
 MIN_GAP = 8                           # do backup ke beech kam se kam itne second
+RETRY_FAILED = 300                    # fail hue channel ko itne second baad dobara try
 _lock = None
 NAME = "linkstore.db.gz"
+
+
+def _ch(cid):
+    return CH.setdefault(cid, {"msg_id": 0, "ts": 0, "seq": 0, "verified": False, "ok": None, "err": "", "last": 0,
+                               "size": 0, "tried": 0})
+
+
+def _sync():
+    """Saare channels ki halat se STATE banao."""
+    chs = [_ch(c) for c in config.BACKUP_CHANNELS]
+    STATE["verified"] = any(c["verified"] for c in chs)
+    STATE["msg_id"] = max([c["msg_id"] for c in chs] or [0])
+    done = [c for c in chs if c["ok"] is not None]
+    STATE["last"] = max([c["last"] for c in chs] or [0])
+    STATE["size"] = max([c["size"] for c in chs] or [0])
+    if not done:
+        STATE["ok"], STATE["err"] = None, ""
+    else:
+        good = [c for c in done if c["ok"]]
+        STATE["ok"] = bool(good)
+        errs = [f"{cid}: {_ch(cid)['err']}" for cid in config.BACKUP_CHANNELS if _ch(cid)["ok"] is False]
+        STATE["err"] = " | ".join(errs)[:200]
 
 
 def _ts_of(caption):
@@ -29,90 +60,142 @@ def _ts_of(caption):
     return int(m.group(1)) if m else 0
 
 
+def _seq_of(caption):
+    m = re.search(r"seq=(\d+)", caption or "")
+    return int(m.group(1)) if m else 0
+
+
+SEQ = {"n": 0}          # har upload ka badhta number: ek hi second me 2 copy hon to bhi pata chale kaunsi nayi hai
+
+
 async def _caption(ts):
     tot, act, _ = await db.count_users()
-    return f"link-store backup | ts={ts} | users={tot} | channels={len(db.channels)} | do not delete (pinned)"
+    SEQ["n"] += 1
+    return f"link-store backup | ts={ts} | seq={SEQ['n']} | users={tot} | channels={len(db.channels)} | do not delete (pinned)"
 
 
-async def _find_remote():
-    """Channel ka pinned backup. -> (message_id, file_id, ts) ya None"""
-    chat = await ui.api("getChat", chat_id=config.BACKUP_CHANNEL, _retries=2)
+async def _find_remote(cid):
+    """Channel ka pinned backup. -> (message_id, file_id, ts) ya None. Channel na mile to TgError."""
+    chat = await ui.api("getChat", chat_id=cid, _retries=2)
     pm = chat.get("pinned_message") or {}
     doc = pm.get("document")
     if not doc:
         return None
-    return pm["message_id"], doc["file_id"], _ts_of(pm.get("caption"))
+    cap = pm.get("caption")
+    return pm["message_id"], doc["file_id"], _ts_of(cap), _seq_of(cap)
 
 
-async def restore_if_needed():
-    """db.init se PEHLE bulao. Text me result lautata hai (log ke liye).
-    STATE["verified"]=True tabhi hota hai jab channel ka backup sahi se check ho gaya
-    (warna galti se purana achha backup khali DB se overwrite ho sakta tha)."""
-    if not config.BACKUP_CHANNEL:
-        return "backup channel not set - skipping restore"
-    try:
-        remote = await _find_remote()
-    except TgError as e:
-        return f"backup channel unreachable ({e}) - bot ko channel me admin banao"
-    if not remote:
-        STATE["verified"] = True
-        return "no backup found in channel (first run?)"
-    msg_id, file_id, rts = remote
-    STATE["msg_id"] = msg_id
-    lts = local_last_write()
-    if lts and lts >= rts:
-        STATE["verified"] = True
-        return f"local db is up to date (local {lts} >= backup {rts})"
-    try:
-        data = await ui.download_file(file_id)
-        ok = restore_file(data)
-    except Exception as e:      # noqa
-        return f"restore failed: {type(e).__name__}: {e}"
-    if not ok:
-        return "backup file was corrupt - not restored"
-    STATE["last"] = rts
-    STATE["verified"] = True
-    return f"restored from channel backup (ts={rts})"
+async def _inspect():
+    """Saare channels dekho -> (mile hue [(cid, remote ya None)], galat [(cid, error text)])"""
+    async def one(cid):
+        try:
+            return cid, await _find_remote(cid), None
+        except TgError as e:
+            return cid, None, str(e.desc)[:80]
+        except Exception as e:      # noqa
+            return cid, None, f"{type(e).__name__}"
+    got = await asyncio.gather(*(one(c) for c in config.BACKUP_CHANNELS))
+    return [(c, r) for c, r, e in got if e is None], [(c, e) for c, r, e in got if e is not None]
 
 
-async def restore_now():
-    """Panel ke 'Restore' button se: channel ke backup se abhi ka data badal do. -> (ok, text)"""
-    if not config.BACKUP_CHANNEL:
-        return False, "BACKUP_CHANNEL set nahi hai"
-    try:
-        remote = await _find_remote()
-        if not remote:
-            return False, "channel me koi backup nahi mila"
-        msg_id, file_id, rts = remote
-        data = await ui.download_file(file_id)
-    except Exception as e:      # noqa
-        return False, f"download fail: {e}"
-    # pehle jaanch lo (galat file se live DB kharab na ho)
-    import gzip
-    import os
-    import sqlite3
-    import tempfile
+def _valid(data):
+    """Backup file theek hai? (live DB ko chhue bina)"""
     try:
         raw = gzip.decompress(data)
         tmp = os.path.join(tempfile.gettempdir(), "restore_check.db")
         with open(tmp, "wb") as f:
             f.write(raw)
         cn = sqlite3.connect(tmp)
-        good = cn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        cn.close()
-        os.remove(tmp)
-        if not good:
-            return False, "backup file kharab hai - restore nahi kiya"
-    except Exception as e:      # noqa
-        return False, f"backup file padh nahi paya: {e}"
-    async with _get_lock():
-        await db.close()
-        ok = restore_file(data)
-        await db.reopen()
+        try:
+            good = cn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            cn.execute("SELECT COUNT(*) FROM users").fetchone()
+        finally:
+            cn.close()
+            os.remove(tmp)
+        return good
+    except Exception:       # noqa
+        return False
+
+
+async def restore_if_needed():
+    """db.init se PEHLE bulao. Text me result lautata hai (log ke liye).
+    verified tabhi hota hai jab channel ka backup sahi se check ho gaya
+    (warna galti se purana achha backup khali DB se overwrite ho sakta tha)."""
+    if not config.BACKUP_CHANNELS:
+        return "backup channel not set - skipping restore"
+    found, bad = await _inspect()
+    for cid, e in bad:
+        c = _ch(cid)
+        c.update(ok=False, err=f"channel nahi mila: {e}", verified=False)
+    if not found:
+        _sync()
+        return f"backup channel(s) unreachable ({'; '.join(f'{c}: {e}' for c, e in bad)}) - bot ko channel me admin banao"
+    for cid, remote in found:
+        c = _ch(cid)
+        c["msg_id"] = remote[0] if remote else 0
+        c["ts"] = remote[2] if remote else 0
+        c["seq"] = remote[3] if remote else 0
+    SEQ["n"] = max([SEQ["n"]] + [r[3] for _c, r in found if r])
+    cands = sorted([((r[2], r[3]), cid, r) for cid, r in found if r], reverse=True)
+    lts = local_last_write()
+
+    def verify_all():
+        for cid, _r in found:
+            _ch(cid).update(verified=True, ok=None, err="")
+        _sync()
+
+    if not cands:
+        verify_all()
+        return "no backup found in channel(s) (first run?)"
+    if lts and lts >= cands[0][0][0]:
+        verify_all()
+        return f"local db is up to date (local {lts} >= backup {cands[0][0][0]})"
+    for (rts, _sq), cid, (msg_id, file_id, _t, _s) in cands:       # sabse naya pehle, kharab ho to agla
+        try:
+            data = await ui.download_file(file_id)
+            ok = restore_file(data)
+        except Exception as e:      # noqa
+            print(f"restore from {cid} failed: {type(e).__name__}: {e}")
+            continue
+        if ok:
+            STATE["last"] = rts
+            verify_all()
+            return f"restored from channel backup (ts={rts}, channel {cid})"
+    _sync()
+    return "restore failed: sab backup kharab ya download nahi hue - purana backup safe rakha"
+
+
+async def restore_now():
+    """Panel ke 'Restore' button se: channels ke sabse naye backup se abhi ka data badal do. -> (ok, text)"""
+    if not config.BACKUP_CHANNELS:
+        return False, "BACKUP_CHANNEL set nahi hai"
+    found, bad = await _inspect()
+    cands = sorted([((r[2], r[3]), cid, r) for cid, r in found if r], reverse=True)
+    if not cands:
+        return False, "channel me koi backup nahi mila" if found else "channel(s) nahi mile (bot admin hai?)"
+    last_err = ""
+    for (rts, _sq), cid, (msg_id, file_id, _t, _s) in cands:
+        try:
+            data = await ui.download_file(file_id)
+        except Exception as e:      # noqa
+            last_err = f"download fail: {e}"
+            continue
+        if not _valid(data):
+            last_err = "backup file kharab hai - restore nahi kiya"
+            continue
+        async with _get_lock():
+            await db.close()
+            ok = restore_file(data)
+            await db.reopen()
         if not ok:
-            return False, "restore fail (purana data wapas chalu)"
-    STATE.update(msg_id=msg_id, last=rts, verified=True)
-    return True, f"restore ho gaya (backup ts={rts})"
+            last_err = "restore fail (purana data wapas chalu)"
+            continue
+        for c, r in found:
+            _ch(c).update(verified=True, msg_id=r[0] if r else 0, ts=r[2] if r else 0, seq=r[3] if r else 0)
+        STATE["last"] = rts
+        _sync()
+        return True, f"restore ho gaya (backup ts={rts})"
+    return False, last_err or "restore nahi hua"
 
 
 def _get_lock():
@@ -122,52 +205,81 @@ def _get_lock():
     return _lock
 
 
-async def backup_now(force=False):
-    """True = backup ho gaya (ya zaroorat nahi thi). False = fail."""
-    if not config.BACKUP_CHANNEL:
+async def _push(cid, data, cap, seq=0):
+    """Ek channel me file update (edit) ya nayi bhejo + pin. True/False."""
+    c = _ch(cid)
+    c["tried"] = time.time()
+    try:
+        done = False
+        if c["msg_id"]:
+            try:
+                await ui.edit_document(cid, c["msg_id"], NAME, data, cap)
+                done = True
+            except TgError as e:
+                if e.not_modified:
+                    done = True
+                else:
+                    print(f"backup edit failed ({cid}), sending new: {e}")
+        if not done:
+            m = await ui.send_document(cid, NAME, data, cap)
+            old = c["msg_id"]
+            c["msg_id"] = m["message_id"]
+            try:
+                await ui.api("pinChatMessage", chat_id=cid, message_id=m["message_id"],
+                             disable_notification=True, _retries=1)
+            except TgError as e:
+                print(f"pin failed ({cid}) (bot ko Pin/Edit right do): {e}")
+            if old:
+                await ui.delete(cid, old)
+        c.update(ok=True, err="", last=int(time.time()), size=len(data) // 1024, seq=seq)
+        return True
+    except Exception as e:        # noqa
+        c.update(ok=False, err=f"{type(e).__name__}: {e}"[:120])
+        print(f"backup error ({cid}): {c['err']}")
         return False
-    if not STATE["verified"]:
-        # channel ka purana backup check nahi hua - overwrite nahi karenge (data bachane ke liye)
-        STATE.update(ok=False, err="channel ka backup verify nahi hua (bot admin hai?)")
-        return False
+
+
+async def _backup(chs, force=False, mark_clean=True):
     async with _get_lock():
-        if not force and not db.dirty and STATE["msg_id"]:
+        if not force and mark_clean and not db.dirty and all(_ch(c)["msg_id"] for c in chs):
             return True
-        db.clear_dirty()                       # snapshot ke dauran naya badlav fir se dirty karega
+        if mark_clean:
+            db.clear_dirty()                   # snapshot ke dauran naya badlav fir se dirty karega
         try:
             data = await db.snapshot_gz()
             if len(data) > MAX_BYTES:
                 raise RuntimeError(f"backup too big ({len(data) // 1024} KB)")
             ts = int(await db.get_meta("last_write", 0))
             cap = await _caption(ts)
-            done = False
-            if STATE["msg_id"]:
-                try:
-                    await ui.edit_document(config.BACKUP_CHANNEL, STATE["msg_id"], NAME, data, cap)
-                    done = True
-                except TgError as e:
-                    if e.not_modified:
-                        done = True
-                    else:
-                        print(f"backup edit failed, sending new: {e}")
-            if not done:
-                m = await ui.send_document(config.BACKUP_CHANNEL, NAME, data, cap)
-                old = STATE["msg_id"]
-                STATE["msg_id"] = m["message_id"]
-                try:
-                    await ui.api("pinChatMessage", chat_id=config.BACKUP_CHANNEL,
-                                 message_id=m["message_id"], disable_notification=True, _retries=1)
-                except TgError as e:
-                    print(f"pin failed (bot ko Pin/Edit right do): {e}")
-                if old:
-                    await ui.delete(config.BACKUP_CHANNEL, old)
-            STATE.update(last=int(time.time()), ok=True, err="", size=len(data) // 1024)
-            return True
         except Exception as e:        # noqa
-            db.touch(True)
-            STATE.update(ok=False, err=f"{type(e).__name__}: {e}"[:200])
-            print(f"backup error: {STATE['err']}")
+            if mark_clean:
+                db.touch(True)
+            for c in chs:
+                _ch(c).update(ok=False, err=f"{type(e).__name__}: {e}"[:120])
+            print(f"backup error: {type(e).__name__}: {e}")
+            _sync()
             return False
+        seq = SEQ["n"]
+        res = await asyncio.gather(*(_push(c, data, cap, seq) for c in chs))
+        for c, ok in zip(chs, res):
+            if ok:
+                _ch(c)["ts"] = ts
+        if not any(res) and mark_clean:
+            db.touch(True)                     # kisi me nahi gaya: baad me fir koshish
+        _sync()
+        return any(res)
+
+
+async def backup_now(force=False):
+    """True = kam se kam ek channel me backup ho gaya (ya zaroorat nahi thi). False = fail."""
+    if not config.BACKUP_CHANNELS:
+        return False
+    chs = [c for c in config.BACKUP_CHANNELS if _ch(c)["verified"]]
+    if not chs:
+        # channel ka purana backup check nahi hua - overwrite nahi karenge (data bachane ke liye)
+        STATE.update(ok=False, err="channel ka backup verify nahi hua (bot admin hai?)")
+        return False
+    return await _backup(chs, force=force)
 
 
 async def send_copy_to(chat_id):
@@ -176,16 +288,64 @@ async def send_copy_to(chat_id):
     return await ui.send_document(chat_id, NAME, data, "💾 link-store backup copy (safe jagah rakho)")
 
 
+def channel_lines():
+    """Panel ke liye: [(channel id, '✅ 3m ago' / '❌ error' / '⏳ ...')]"""
+    out = []
+    for cid in config.BACKUP_CHANNELS:
+        c = _ch(cid)
+        if c["ok"] is False:
+            s = f"❌ {c['err'][:40]}"
+        elif not c["verified"]:
+            s = "⏳ checking"
+        elif not c["last"]:
+            s = "⏳ pending"
+        else:
+            ago = int(time.time() - c["last"])
+            s = f"✅ {ago}s ago" if ago < 120 else f"✅ {ago // 60}m ago"
+        out.append((cid, s))
+    return out
+
+
 def status():
-    if not config.BACKUP_CHANNEL:
+    chs = config.BACKUP_CHANNELS
+    if not chs:
         return "❌ not set"
-    if STATE["ok"] is False:
+    n = len(chs)
+    states = [_ch(c) for c in chs]
+    okc = sum(1 for c in states if c["ok"] and c["last"])
+    if okc == 0 and any(c["ok"] is False for c in states):
         return f"❌ failed ({STATE['err'][:50]})"
-    if not STATE["last"]:
+    if okc == 0:
         return "⏳ pending"
     ago = int(time.time() - STATE["last"])
     when = f"{ago}s ago" if ago < 120 else f"{ago // 60}m ago"
-    return f"✅ {when} ({STATE['size']} KB)"
+    extra = f" · {okc}/{n} channels" if n > 1 else ""
+    warn = " ⚠️" if okc < n else ""
+    return f"✅ {when} ({STATE['size']} KB){extra}{warn}"
+
+
+async def _verify_late(cid):
+    """Shuru me jo channel nahi mila tha, use dobara dekho."""
+    c = _ch(cid)
+    try:
+        remote = await _find_remote(cid)
+    except TgError as e:
+        c.update(ok=False, err=f"channel nahi mila: {str(e.desc)[:60]}")
+        return
+    if not remote:
+        c.update(verified=True, ok=None, err="", msg_id=0, ts=0, seq=0)
+        return
+    msg_id, file_id, rts, _sq = remote
+    SEQ['n'] = max(SEQ['n'], _sq)
+    lts = local_last_write()
+    if lts and lts >= rts:
+        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts, seq=_sq)
+        return
+    ok, msg = await restore_now()                  # channel ka backup local se naya hai
+    print(f"late restore: {msg}")
+    if ok:
+        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts)
+        await ui.notify_owner(f"♻️ <b>Backup channel ab mila</b>: {ui.esc(msg)}")
 
 
 async def loop():
@@ -194,30 +354,30 @@ async def loop():
     await asyncio.sleep(15)
     while True:
         try:
-            if config.BACKUP_CHANNEL and not STATE["verified"]:
-                # shuru me channel nahi mila tha - dobara koshish
-                try:
-                    remote = await _find_remote()
-                    if not remote:
-                        STATE["verified"] = True
-                    else:
-                        ok, msg = await restore_now()
-                        print(f"late restore: {msg}")
-                        await ui.notify_owner(f"♻️ <b>Backup channel ab mila</b>: {ui.esc(msg)}")
-                except Exception as e:      # noqa
-                    print(f"backup verify retry: {e}")
-                    await asyncio.sleep(55)
+            for cid in config.BACKUP_CHANNELS:
+                if not _ch(cid)["verified"]:
+                    await _verify_late(cid)
+            _sync()
+            chs = [c for c in config.BACKUP_CHANNELS if _ch(c)["verified"]]
             now = time.time()
             since = now - (STATE["last"] or 0)
             due = False
-            if first and not STATE["msg_id"]:
-                due = True
-            elif db.dirty_hi and now - db.dirty_hi >= MIN_GAP and since >= MIN_GAP:
-                due = True
-            elif db.dirty_lo and since >= config.BACKUP_EVERY:
-                due = True
+            if chs:
+                lw = int(await db.get_meta("last_write", 0) or 0)
+                behind = any(not _ch(c)["msg_id"] or _ch(c)["ts"] < lw or _ch(c)["seq"] < SEQ["n"] for c in chs)
+                if first and behind:
+                    due = True
+                elif db.dirty_hi and now - db.dirty_hi >= MIN_GAP and since >= MIN_GAP:
+                    due = True
+                elif db.dirty_lo and since >= config.BACKUP_EVERY:
+                    due = True
             if due:
-                await backup_now(force=first and not STATE["msg_id"])
+                await backup_now(force=first and behind)
+            elif chs:
+                # kisi channel me fail hua tha? sirf usi ko dobara koshish (baaki me phir se upload nahi)
+                bad = [c for c in chs if _ch(c)["ok"] is False and now - _ch(c)["tried"] >= RETRY_FAILED]
+                if bad:
+                    await _backup(bad, force=True, mark_clean=False)
             first = False
         except Exception as e:      # noqa
             print(f"backup loop: {e}")

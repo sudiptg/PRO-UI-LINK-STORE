@@ -26,9 +26,9 @@ _loading = 0
 
 
 def home_rows(uid):
-    rows = [[B(lbl("about", "ℹ️"), cb="about"), B(lbl("channels", "📢"), cb="channels")]]
+    rows = [[B(lbl("about"), cb="about"), B(lbl("channels"), cb="channels")]]
     if hf.is_admin(uid):
-        rows.append([B(lbl("admin panel", "👑"), cb="a:home")])
+        rows.append([B(lbl("admin panel"), cb="a:home")])
     rows.append([ui.close_btn()])
     return rows
 

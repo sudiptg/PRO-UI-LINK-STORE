@@ -43,6 +43,7 @@ async def send_home(chat_id, uid):
 
 # ================================================================ /start
 async def start(m, payload):
+    """Loading animation SIRF home aur force-sub screen par. Link wale message par nahi (wo bina photo, seedha)."""
     global _loading
     u = m["from"]
     uid = u["id"]
@@ -63,25 +64,22 @@ async def start(m, payload):
     except Exception as e:      # noqa
         print(f"add_user: {e}")
 
-    # 1) pehle loading animation wala message (photo ke saath)
+    try:
+        kind, text, rows, expiry, fallback = await _resolve(u, uid, payload)
+    except Exception as e:      # noqa
+        print(f"start resolve: {type(e).__name__}: {e}")
+        kind, text, rows, expiry, fallback = "link", BAD_LINK, None, None, None
+
     lm = None
     counted = False
-    if LOADER_ON and _loading < LOADER_MAX:
+    if kind != "link" and LOADER_ON and _loading < LOADER_MAX:      # sirf home / force-sub
         _loading += 1
         counted = True
-        lm = await _safe(ui.send, chat_id, _loader_text(0), None)          # loading me photo nahi
+        lm = await _safe(ui.send, chat_id, _loader_text(0), None)   # loading me photo nahi
+        if lm:
+            await _animate(lm)
     try:
-        anim = asyncio.create_task(_animate(lm)) if lm else None
-        # 2) animation ke saath-saath asli kaam (force-sub check / link / home) chalta rehta hai
-        try:
-            text, rows, expiry, fallback = await _resolve(u, uid, payload)
-        except Exception as e:      # noqa
-            print(f"start resolve: {type(e).__name__}: {e}")
-            text, rows, expiry, fallback = BAD_LINK, None, None, None
-        if anim:
-            await anim
-        # 3) usi message ko edit karke final screen
-        await _present(chat_id, lm, text, rows, expiry, fallback)
+        await _present(chat_id, lm, kind, text, rows, expiry, fallback)
     finally:
         if counted:
             _loading -= 1
@@ -92,7 +90,7 @@ def _loader_text(i):
 
 
 async def _animate(lm):
-    """Loading. (send ho chuka) -> Loading.. -> Loading..., har ek ~_STEP sec dikhta hai. Message gayab / user ne block kiya to chup-chaap ruk jata hai."""
+    """Loading. -> Loading.. -> Loading..., har ek ~_STEP sec. Message gayab / user ne block kiya to chup-chaap ruk jata hai."""
     try:
         for i in (1, 2):
             await asyncio.sleep(_STEP)
@@ -103,7 +101,8 @@ async def _animate(lm):
 
 
 async def _resolve(u, uid, payload):
-    """Final screen banao (bheje bina) -> (text, rows, expiry_secs ya None, fallback_text ya None)."""
+    """Final screen banao (bheje bina) -> (kind, text, rows, expiry_secs ya None, fallback_text ya None).
+    kind: "force" (force-sub), "home", "link" (link wala message)."""
     fsub = db.get_fsub_channels()
     if fsub and not hf.is_admin(uid):
         ok, _, rows = await hf.check_subscription_status(uid, fsub, payload=payload)
@@ -114,16 +113,16 @@ async def _resolve(u, uid, payload):
                                                mention=hf.mention(u), id=uid)
             except Exception:       # noqa
                 text = config.FORCE_MSG
-            return text + db.get_brand_footer(), rows, None, None
+            return "force", text + db.get_brand_footer(), rows, None, None
     if not payload:
-        return home_text(), home_rows(uid), None, None
-    return await build_delivery(payload)
+        return "home", home_text(), home_rows(uid), None, None
+    return ("link",) + tuple(await build_delivery(payload))
 
 
-async def _present(chat_id, lm, text, rows, expiry=None, fallback=None):
-    """Final screen. Photo hai to: photo wala message bhejo aur loading message hata do
-    (Telegram text message ko edit karke photo nahi bana sakta). Photo nahi hai to loading message hi edit hota hai."""
-    pic = config.START_PIC or None
+async def _present(chat_id, lm, kind, text, rows, expiry=None, fallback=None):
+    """home / force-sub: photo ke saath (loading message ho to wo hata diya jata hai - Telegram text ko edit karke
+    photo nahi bana sakta). link: bina photo ke seedha text."""
+    pic = (config.START_PIC or None) if kind != "link" else None
     mid = None
     try:
         if lm and not pic:

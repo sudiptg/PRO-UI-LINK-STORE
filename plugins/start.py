@@ -69,7 +69,7 @@ async def start(m, payload):
     if LOADER_ON and _loading < LOADER_MAX:
         _loading += 1
         counted = True
-        lm = await _safe(ui.send, chat_id, _loader_text(0), None, photo=config.START_PIC or None)
+        lm = await _safe(ui.send, chat_id, _loader_text(0), None)          # loading me photo nahi
     try:
         anim = asyncio.create_task(_animate(lm)) if lm else None
         # 2) animation ke saath-saath asli kaam (force-sub check / link / home) chalta rehta hai
@@ -96,7 +96,7 @@ async def _animate(lm):
     try:
         for i in (1, 2):
             await asyncio.sleep(_STEP)
-            await ui.edit(lm["chat"]["id"], lm["message_id"], _loader_text(i), None, caption=bool(config.START_PIC))
+            await ui.edit(lm["chat"]["id"], lm["message_id"], _loader_text(i), None)
         await asyncio.sleep(_STEP * 0.6)               # aakhri 'Loading...' thoda dikhe, phir asli screen
     except Exception:       # noqa
         pass
@@ -121,33 +121,34 @@ async def _resolve(u, uid, payload):
 
 
 async def _present(chat_id, lm, text, rows, expiry=None, fallback=None):
-    """lm (loading message) ho to usi ko edit karo, warna naya bhejo. Link wale message ko expiry pe delete schedule."""
+    """Final screen. Photo hai to: photo wala message bhejo aur loading message hata do
+    (Telegram text message ko edit karke photo nahi bana sakta). Photo nahi hai to loading message hi edit hota hai."""
     pic = config.START_PIC or None
     mid = None
     try:
-        if lm:
-            msg = dict(lm, chat={"id": chat_id})
-            if pic:
-                msg["photo"] = [{}]                      # loader photo wala tha -> caption edit
-            res = await ui.show(msg, text, rows, photo=pic)
+        if lm and not pic:
+            res = await ui.show(dict(lm, chat={"id": chat_id}), text, rows, photo=None)
+            if isinstance(res, dict) and "message_id" in res:
+                mid = res["message_id"]
+            elif res:
+                mid = lm["message_id"]
+            if not res and fallback:
+                await _safe(ui.send, chat_id, fallback)
         else:
             res = await ui.send(chat_id, text, rows, photo=pic)
-        if isinstance(res, dict) and "message_id" in res:
-            mid = res["message_id"]
-        elif res and lm:
-            mid = lm["message_id"]
-        if not res and fallback:                         # button ka link theek nahi tha: text me link bhejo
-            return await _safe(ui.send, chat_id, fallback)
+            mid = res.get("message_id") if isinstance(res, dict) else None
     except TgError as e:
         if e.user_gone:
             return
         if e.code == 400 and fallback:                   # button ka link theek nahi: text me link bhejo
-            return await _safe(ui.send, chat_id, fallback)
-        print(f"present error: {e}")
-        return
+            await _safe(ui.send, chat_id, fallback)
+        else:
+            print(f"present error: {e}")
     except Exception as e:      # noqa
         print(f"present error: {type(e).__name__}: {e}")
-        return
+    finally:
+        if lm and pic:                                   # photo aane ke baad loading wala message gayab
+            await ui.delete(chat_id, lm["message_id"])
     if expiry and mid:
         ui.schedule_delete(chat_id, mid, expiry)         # link expire ke saath message bhi hat jaye
 

@@ -21,7 +21,8 @@ def home_rows():
         [B(lbl("admins", "👑"), cb="a:ad:V"), B(lbl("brand", "🏷️"), cb="a:br:V")],
         [B(lbl("ban", "🚫"), cb="a:bn:V"), B(lbl("settings", "⚙️"), cb="a:se:V")],
         [B(lbl("backup", "💾"), cb="a:bk:V"), B(lbl("health", "❤️"), cb="a:st:H")],
-        [B(lbl("help", "📖"), cb="a:hp"), ui.back_btn("home")],
+        [B(lbl("ch buttons", "🔘"), cb="a:cb:V"), B(lbl("help", "📖"), cb="a:hp")],
+        [ui.back_btn("home")],
     ]
 
 
@@ -94,10 +95,19 @@ async def cb_settings(cb, parts):
 
 
 # ================================================================ backup
+def _channels_block():
+    chans = tgbackup.channel_lines()
+    if not chans:
+        return "• <b>ᴄʜᴀɴɴᴇʟ:</b> <code>NOT SET</code>\n"
+    if len(chans) == 1:
+        return f"• <b>ᴄʜᴀɴɴᴇʟ:</b> <code>{chans[0][0]}</code>\n"
+    return "• <b>ᴄʜᴀɴɴᴇʟs:</b>\n" + "".join(f"   {i}. <code>{cid}</code> — {esc(st)}\n" for i, (cid, st) in enumerate(chans, 1))
+
+
 def backup_view(note=""):
     text = ("<b>›› 💾 ʙᴀᴄᴋᴜᴘ (ᴛᴇʟᴇɢʀᴀᴍ ᴄʜᴀɴɴᴇʟ)</b>\n\n"
             "<blockquote>"
-            f"• <b>ᴄʜᴀɴɴᴇʟ:</b> <code>{config.BACKUP_CHANNEL or 'NOT SET'}</code>\n"
+            f"{_channels_block()}"
             f"• <b>sᴛᴀᴛᴜs:</b> {esc(tgbackup.status())}\n"
             f"• <b>ʟᴏᴄᴀʟ ᴅʙ:</b> <code>{db.size_kb()} KB</code>"
             "</blockquote>\n"

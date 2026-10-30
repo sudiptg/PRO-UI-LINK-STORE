@@ -10,7 +10,7 @@ import time
 import config
 import helper_func as hf
 import ui
-from bot import route, on_input, set_state, clear_state, pm_of
+from bot import route, on_input, set_state, clear_state, pm_of, _is_msg
 from database.database import db, today
 from database import tgbackup
 from ui import B, TgError, lbl, esc, bar
@@ -217,10 +217,11 @@ async def cb_broadcast(cb, parts):
     if act == "N":
         if BC["running"]:
             return await ui.show(msg, _progress_text(), [[B(lbl("stop", "🛑"), cb="a:bc:STOP")], [ui.back_btn("a:home")]])
-        set_state(uid, "bcmsg", pm=pm_of(msg), back="a:bc:P")
-        return await ui.show(msg, "<b>›› 📣 ɴᴇᴡ ʙʀᴏᴀᴅᴄᴀsᴛ</b>\n\n<blockquote>ɴᴏᴡ sᴇɴᴅ ᴍᴇ ᴛʜᴇ ᴍᴇssᴀɢᴇ ᴛᴏ ʙʀᴏᴀᴅᴄᴀsᴛ. "
-                             "ᴅᴏɴ'ᴛ ᴅᴇʟᴇᴛᴇ ɪᴛ ᴜɴᴛɪʟ ᴛʜᴇ ʙʀᴏᴀᴅᴄᴀsᴛ ɪs ᴅᴏɴᴇ.</blockquote>",
-                             [[B(lbl("cancel", "✖️"), cb="a:bc:P")]])
+        r = await ui.show(msg, "<b>›› 📣 ɴᴇᴡ ʙʀᴏᴀᴅᴄᴀsᴛ</b>\n\n<blockquote>ɴᴏᴡ sᴇɴᴅ ᴍᴇ ᴛʜᴇ ᴍᴇssᴀɢᴇ ᴛᴏ ʙʀᴏᴀᴅᴄᴀsᴛ. "
+                          "ᴅᴏɴ'ᴛ ᴅᴇʟᴇᴛᴇ ɪᴛ ᴜɴᴛɪʟ ᴛʜᴇ ʙʀᴏᴀᴅᴄᴀsᴛ ɪs ᴅᴏɴᴇ.</blockquote>",
+                          [[B(lbl("cancel", "✖️"), cb="a:bc:P")]])
+        set_state(uid, "bcmsg", pm=pm_of(r if _is_msg(r) else msg), back="a:bc:P")
+        return r
     if act == "RD":
         await db.set_meta("bc", "")
         return await cb_broadcast_back(cb)
@@ -231,8 +232,8 @@ async def cb_broadcast(cb, parts):
             cfg = json.loads(await db.get_meta("bc") or "")
         except ValueError:
             return await ui.show(msg, "<b>⚠️ ɴᴏᴛʜɪɴɢ ᴛᴏ ʀᴇsᴜᴍᴇ.</b>", [[ui.back_btn("a:bc:P")]])
-        await ui.show(msg, _progress_text(), [[B(lbl("stop", "🛑"), cb="a:bc:STOP")]])
-        spawn(run_broadcast(cfg, pm_of(msg)))
+        r = await ui.show(msg, _progress_text(), [[B(lbl("stop", "🛑"), cb="a:bc:STOP")]])
+        spawn(run_broadcast(cfg, pm_of(r if _is_msg(r) else msg)))
         return
     d = DRAFT.get(uid)
     if not d:
@@ -260,9 +261,9 @@ async def cb_broadcast(cb, parts):
         tot, act_n, _ = await db.count_users(fresh=True)
         cfg = dict(d, total=act_n, last=0, ok=0, fail=0, dead=0, finished=False)
         await db.set_meta("bc", json.dumps(cfg), touch=False)
-        await ui.show(msg, _progress_text(), [[B(lbl("stop", "🛑"), cb="a:bc:STOP")]])
+        r = await ui.show(msg, _progress_text(), [[B(lbl("stop", "🛑"), cb="a:bc:STOP")]])
         BC.update(ok=0, fail=0, dead=0, total=act_n)
-        spawn(run_broadcast(cfg, pm_of(msg)))
+        spawn(run_broadcast(cfg, pm_of(r if _is_msg(r) else msg)))
         return
     text, rows = _draft_view(uid)
     await ui.show(msg, text, rows)
@@ -305,7 +306,8 @@ async def cb_cleanup(cb, parts):
     if act == "Y":
         if CL["running"] or BC["running"]:
             return await ui.show(msg, "<b>⚠️ ᴀɴᴏᴛʜᴇʀ ᴊᴏʙ ɪs ʀᴜɴɴɪɴɢ.</b>", [[ui.back_btn("a:home")]])
-        spawn(_run_cleanup(pm_of(msg)))
+        r = await ui.show(msg, "<b>›› 🧹 ᴄʟᴇᴀɴᴜᴘ...</b>", [[B(lbl("stop", "🛑"), cb="a:cl:X")]])
+        spawn(_run_cleanup(pm_of(r if _is_msg(r) else msg)))
 
 
 async def _run_cleanup(pm):

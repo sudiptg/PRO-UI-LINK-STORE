@@ -61,8 +61,8 @@ def cancel_row(back_cb):
 
 async def prompt(cb, act, text, back_cb, **data):
     """Admin se kuch likhwane/forward karwane ke liye: message ko prompt bana do aur state set karo."""
-    set_state(cb["from"]["id"], act, pm=pm_of(cb["message"]), back=back_cb, **data)
-    await ui.show(cb["message"], text, [cancel_row(back_cb)])
+    r = await ui.show(cb["message"], text, [cancel_row(back_cb)])
+    set_state(cb["from"]["id"], act, pm=pm_of(r if _is_msg(r) else cb["message"]), back=back_cb, **data)
 
 
 async def answer_input(m, st, text, rows, keep_state=False):
@@ -75,15 +75,25 @@ async def answer_input(m, st, text, rows, keep_state=False):
     asyncio.create_task(ui.delete(m["chat"]["id"], m["message_id"]))
     pm = st.get("pm")
     if pm:
+        ui.ADMIN_MODE.set(True)
         r = await ui.show(pm, text, rows)
         if r is not None:
+            if keep_state and _is_msg(r):
+                st["pm"] = pm_of(r)              # message photo<->text ban gaya ho to nayi pehchaan yaad rakho
             return r
     return await ui.send(m["chat"]["id"], text, rows)
 
 
+def _is_msg(r):
+    return isinstance(r, dict) and r.get("message_id") and (r.get("chat") or {}).get("id") is not None
+
+
 def pm_of(msg):
-    """Panel message ki pehchaan (baad me edit karne ke liye)."""
-    return {"chat": {"id": msg["chat"]["id"]}, "message_id": msg["message_id"]}
+    """Panel message ki pehchaan (baad me edit karne ke liye). Photo wala hai ya text wala, ye bhi yaad rakhta hai."""
+    d = {"chat": {"id": msg["chat"]["id"]}, "message_id": msg["message_id"]}
+    if ui.has_media(msg):
+        d["photo"] = True
+    return d
 
 
 # ================================================================ messages
@@ -110,6 +120,7 @@ async def on_message(m):
         if st:
             fn = INPUTS.get(st["act"])
             if fn:
+                ui.ADMIN_MODE.set(True)
                 await fn(m, st)
                 return
         if text.startswith("/"):
@@ -140,6 +151,7 @@ async def on_callback(cb):
     if not late:
         asyncio.create_task(ui.answer(cb["id"]))
     if key.startswith("a:"):
+        ui.ADMIN_MODE.set(True)          # admin screens par photo (PANEL_PIC)
         clear_state(uid)                 # koi purana "input ka intezaar" ho to hata do
     try:
         await fn(cb, parts)

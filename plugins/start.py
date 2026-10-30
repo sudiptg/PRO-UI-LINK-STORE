@@ -3,6 +3,7 @@
 Public user ka poora kaam yahin. Bahut tez: RAM lookups + ek hi message.
 """
 import asyncio
+import os
 import time
 from collections import defaultdict
 
@@ -15,6 +16,13 @@ from ui import B, TgError, lbl, sc, esc
 
 _locks = defaultdict(asyncio.Lock)          # (channel, is_req) -> lock
 _warn_ts = {}
+
+# ---- loading animation (band karna ho to Render env me LOADING_ANIM=0)
+LOADER_ON = os.environ.get("LOADING_ANIM", "1") != "0"
+LOADER_MAX = int(os.environ.get("LOADING_MAX", "40") or 40)    # itne se zyada log ek saath aaye to animation skip (bot tez rahe)
+_FRAMES = ("ʟᴏᴀᴅɪɴɢ.", "ʟᴏᴀᴅɪɴɢ..", "ʟᴏᴀᴅɪɴɢ...")                                 # sirf Loading + 1, 2, 3 bindi
+_STEP = float(os.environ.get("LOADING_SPEED", "0.5") or 0.5)                      # har frame kitni der dikhe (sec)
+_loading = 0
 
 
 def home_rows(uid):
@@ -35,6 +43,7 @@ async def send_home(chat_id, uid):
 
 # ================================================================ /start
 async def start(m, payload):
+    global _loading
     u = m["from"]
     uid = u["id"]
     chat_id = m["chat"]["id"]
@@ -54,6 +63,47 @@ async def start(m, payload):
     except Exception as e:      # noqa
         print(f"add_user: {e}")
 
+    # 1) pehle loading animation wala message (photo ke saath)
+    lm = None
+    counted = False
+    if LOADER_ON and _loading < LOADER_MAX:
+        _loading += 1
+        counted = True
+        lm = await _safe(ui.send, chat_id, _loader_text(0), None, photo=config.START_PIC or None)
+    try:
+        anim = asyncio.create_task(_animate(lm)) if lm else None
+        # 2) animation ke saath-saath asli kaam (force-sub check / link / home) chalta rehta hai
+        try:
+            text, rows, expiry, fallback = await _resolve(u, uid, payload)
+        except Exception as e:      # noqa
+            print(f"start resolve: {type(e).__name__}: {e}")
+            text, rows, expiry, fallback = BAD_LINK, None, None, None
+        if anim:
+            await anim
+        # 3) usi message ko edit karke final screen
+        await _present(chat_id, lm, text, rows, expiry, fallback)
+    finally:
+        if counted:
+            _loading -= 1
+
+
+def _loader_text(i):
+    return f"<b>{_FRAMES[i]}</b>"
+
+
+async def _animate(lm):
+    """Loading. (send ho chuka) -> Loading.. -> Loading..., har ek ~_STEP sec dikhta hai. Message gayab / user ne block kiya to chup-chaap ruk jata hai."""
+    try:
+        for i in (1, 2):
+            await asyncio.sleep(_STEP)
+            await ui.edit(lm["chat"]["id"], lm["message_id"], _loader_text(i), None, caption=bool(config.START_PIC))
+        await asyncio.sleep(_STEP * 0.6)               # aakhri 'Loading...' thoda dikhe, phir asli screen
+    except Exception:       # noqa
+        pass
+
+
+async def _resolve(u, uid, payload):
+    """Final screen banao (bheje bina) -> (text, rows, expiry_secs ya None, fallback_text ya None)."""
     fsub = db.get_fsub_channels()
     if fsub and not hf.is_admin(uid):
         ok, _, rows = await hf.check_subscription_status(uid, fsub, payload=payload)
@@ -64,12 +114,42 @@ async def start(m, payload):
                                                mention=hf.mention(u), id=uid)
             except Exception:       # noqa
                 text = config.FORCE_MSG
-            return await _safe(ui.send, chat_id, text + db.get_brand_footer(), rows, photo=config.FORCE_PIC or None)
-
+            return text + db.get_brand_footer(), rows, None, None
     if not payload:
-        return await _safe(send_home, chat_id, uid)
+        return home_text(), home_rows(uid), None, None
+    return await build_delivery(payload)
 
-    await deliver(chat_id, payload)
+
+async def _present(chat_id, lm, text, rows, expiry=None, fallback=None):
+    """lm (loading message) ho to usi ko edit karo, warna naya bhejo. Link wale message ko expiry pe delete schedule."""
+    pic = config.START_PIC or None
+    mid = None
+    try:
+        if lm:
+            msg = dict(lm, chat={"id": chat_id})
+            if pic:
+                msg["photo"] = [{}]                      # loader photo wala tha -> caption edit
+            res = await ui.show(msg, text, rows, photo=pic)
+        else:
+            res = await ui.send(chat_id, text, rows, photo=pic)
+        if isinstance(res, dict) and "message_id" in res:
+            mid = res["message_id"]
+        elif res and lm:
+            mid = lm["message_id"]
+        if not res and fallback:                         # button ka link theek nahi tha: text me link bhejo
+            return await _safe(ui.send, chat_id, fallback)
+    except TgError as e:
+        if e.user_gone:
+            return
+        if e.code == 400 and fallback:                   # button ka link theek nahi: text me link bhejo
+            return await _safe(ui.send, chat_id, fallback)
+        print(f"present error: {e}")
+        return
+    except Exception as e:      # noqa
+        print(f"present error: {type(e).__name__}: {e}")
+        return
+    if expiry and mid:
+        ui.schedule_delete(chat_id, mid, expiry)         # link expire ke saath message bhi hat jaye
 
 
 async def _safe(fn, *a, **kw):
@@ -118,25 +198,24 @@ async def get_invite(cid, is_req):
         return link, expiry
 
 
-async def deliver(chat_id, payload):
+BAD_LINK = "<b><blockquote>⚠️ ɪɴᴠᴀʟɪᴅ ᴏʀ ᴇxᴘɪʀᴇᴅ ɪɴᴠɪᴛᴇ ʟɪɴᴋ.</blockquote></b>"
+
+
+async def build_delivery(payload):
+    """Link ka message banao (bheje bina) -> (text, rows, expiry_secs ya None, fallback_text ya None)."""
     is_req = payload.startswith("req_")
     token = payload[4:] if is_req else payload
-    bad = "<b><blockquote>⚠️ ɪɴᴠᴀʟɪᴅ ᴏʀ ᴇxᴘɪʀᴇᴅ ɪɴᴠɪᴛᴇ ʟɪɴᴋ.</blockquote></b>"
+    cid = None
     try:
         cid = await db.resolve_token(token, is_req)
         if not cid:
-            return await _safe(ui.send, chat_id, bad)
+            return BAD_LINK, None, None, None
 
         original = await db.get_original_link(cid)
         if original:                                  # /genlink wala link
             db.bump_click(cid)
             text = "<b><blockquote>ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ ʟɪɴᴋ:</blockquote></b>" + db.get_brand_footer()
-            try:
-                return await ui.send(chat_id, text, [[B(lbl("proceed to link"), url=original)]])
-            except TgError as e:
-                if e.code == 400 and not e.user_gone:   # button ke liye link theek nahi: text me bhejo
-                    return await ui.send(chat_id, text + f"\n\n{esc(original)}")
-                raise
+            return text, [[B(lbl("proceed to link"), url=original)]], None, text + f"\n\n{esc(original)}"
 
         link, expiry = await get_invite(cid, is_req)
         db.bump_click(cid)
@@ -144,23 +223,19 @@ async def deliver(chat_id, payload):
         text = ("<b><blockquote>ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ ʟɪɴᴋ:</blockquote></b>\n"
                 f"<b><blockquote><u>ɴᴏᴛᴇ: ᴛʜɪs ʟɪɴᴋ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴇxᴘɪʀᴇ ɪɴ {sc(_mins(expiry))}.</u></blockquote></b>"
                 + db.get_brand_footer())
-        sent = await ui.send(chat_id, text, [[B(btn, url=link)]])
-        ui.schedule_delete(chat_id, sent["message_id"], expiry)     # link expire ke saath message bhi hat jaye
+        return text, [[B(btn, url=link)]], expiry, None
     except TgError as e:
-        if e.user_gone:
-            return
         print(f"deliver error: {e}")
-        if e.chat_gone or e.no_rights or e.code == 400:
-            cid_ = locals().get("cid")
-            if cid_ and time.time() - _warn_ts.get(cid_, 0) > 900:
-                _warn_ts[cid_] = time.time()
-                await ui.notify_owner(f"⚠️ <b>Link nahi ban pa raha</b>\n<blockquote>{esc(hf.chat_title(cid_))} "
-                                      f"(<code>{cid_}</code>)\n{esc(e.desc[:120])}</blockquote>\n"
+        if not e.user_gone and (e.chat_gone or e.no_rights or e.code == 400):
+            if cid and time.time() - _warn_ts.get(cid, 0) > 900:
+                _warn_ts[cid] = time.time()
+                await ui.notify_owner(f"⚠️ <b>Link nahi ban pa raha</b>\n<blockquote>{esc(hf.chat_title(cid))} "
+                                      f"(<code>{cid}</code>)\n{esc(e.desc[:120])}</blockquote>\n"
                                       "Bot ko channel me admin banao (Invite Users via Link right).")
-        await _safe(ui.send, chat_id, bad)
+        return BAD_LINK, None, None, None
     except Exception as e:      # noqa
         print(f"deliver error: {type(e).__name__}: {e}")
-        await _safe(ui.send, chat_id, bad)
+        return BAD_LINK, None, None, None
 
 
 # ================================================================ buttons (public)

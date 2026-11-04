@@ -20,7 +20,7 @@ _warn_ts = {}
 # ---- loading animation (band karna ho to Render env me LOADING_ANIM=0)
 LOADER_ON = os.environ.get("LOADING_ANIM", "1") != "0"
 LOADER_MAX = int(os.environ.get("LOADING_MAX", "40") or 40)    # itne se zyada log ek saath aaye to animation skip (bot tez rahe)
-_FRAMES = ("⚡", "✨", "🎊")                                 # sirf Loading + 1, 2, 3 bindi
+_FRAMES = ("ʟᴏᴀᴅɪɴɢ.", "ʟᴏᴀᴅɪɴɢ..", "ʟᴏᴀᴅɪɴɢ...")                                 # sirf Loading + 1, 2, 3 bindi
 _STEP = float(os.environ.get("LOADING_SPEED", "0.5") or 0.5)                      # har frame kitni der dikhe (sec)
 _loading = 0
 

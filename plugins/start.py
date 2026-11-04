@@ -65,10 +65,10 @@ async def start(m, payload):
         print(f"add_user: {e}")
 
     try:
-        kind, text, rows, expiry, fallback = await _resolve(u, uid, payload)
+        kind, text, rows, expiry, fallback, after = await _resolve(u, uid, payload)
     except Exception as e:      # noqa
         print(f"start resolve: {type(e).__name__}: {e}")
-        kind, text, rows, expiry, fallback = "link", BAD_LINK, None, None, None
+        kind, text, rows, expiry, fallback, after = "link", BAD_LINK, None, None, None, None
 
     lm = None
     counted = False
@@ -79,7 +79,7 @@ async def start(m, payload):
         if lm:
             await _animate(lm)
     try:
-        await _present(chat_id, lm, kind, text, rows, expiry, fallback)
+        await _present(chat_id, lm, kind, text, rows, expiry, fallback, after)
     finally:
         if counted:
             _loading -= 1
@@ -101,8 +101,8 @@ async def _animate(lm):
 
 
 async def _resolve(u, uid, payload):
-    """Final screen banao (bheje bina) -> (kind, text, rows, expiry_secs ya None, fallback_text ya None).
-    kind: "force" (force-sub), "home", "link" (link wala message)."""
+    """Final screen banao (bheje bina) -> (kind, text, rows, expiry_secs ya None, fallback_text ya None, after_text ya None).
+    kind: "force" (force-sub), "home", "link" (link wala message). after_text = button wale message ke BAAD alag message me jaane wala note."""
     fsub = db.get_fsub_channels()
     if fsub and not hf.is_admin(uid):
         ok, _, rows = await hf.check_subscription_status(uid, fsub, payload=payload)
@@ -113,13 +113,13 @@ async def _resolve(u, uid, payload):
                                                mention=hf.mention(u), id=uid)
             except Exception:       # noqa
                 text = config.FORCE_MSG
-            return "force", text + db.get_brand_footer(), rows, None, None
+            return "force", text + db.get_brand_footer(), rows, None, None, None
     if not payload:
-        return "home", home_text(), home_rows(uid), None, None
+        return "home", home_text(), home_rows(uid), None, None, None
     return ("link",) + tuple(await build_delivery(payload))
 
 
-async def _present(chat_id, lm, kind, text, rows, expiry=None, fallback=None):
+async def _present(chat_id, lm, kind, text, rows, expiry=None, fallback=None, after=None):
     """home / force-sub: photo ke saath (loading message ho to wo hata diya jata hai - Telegram text ko edit karke
     photo nahi bana sakta). link: bina photo ke seedha text."""
     pic = (config.START_PIC or None) if kind != "link" else None
@@ -148,8 +148,13 @@ async def _present(chat_id, lm, kind, text, rows, expiry=None, fallback=None):
     finally:
         if lm and pic:                                   # photo aane ke baad loading wala message gayab
             await ui.delete(chat_id, lm["message_id"])
-    if expiry and mid:
-        ui.schedule_delete(chat_id, mid, expiry)         # link expire ke saath message bhi hat jaye
+    ids = [mid] if mid else []
+    if after and mid:                                    # button ke BAAD note (alag message, bina awaaz ke)
+        res2 = await _safe(ui.send, chat_id, after, None, disable_notification=True)
+        if isinstance(res2, dict) and res2.get("message_id"):
+            ids.append(res2["message_id"])
+    if expiry and ids:
+        ui.schedule_delete(chat_id, ids, expiry)         # link expire ke saath dono message hat jayen
 
 
 async def _safe(fn, *a, **kw):
@@ -202,28 +207,28 @@ BAD_LINK = "<b><blockquote>⚠️ ɪɴᴠᴀʟɪᴅ ᴏʀ ᴇxᴘɪʀᴇᴅ ɪɴ
 
 
 async def build_delivery(payload):
-    """Link ka message banao (bheje bina) -> (text, rows, expiry_secs ya None, fallback_text ya None)."""
+    """Link ka message banao (bheje bina) -> (text, rows, expiry_secs ya None, fallback_text ya None, after_text ya None)."""
     is_req = payload.startswith("req_")
     token = payload[4:] if is_req else payload
     cid = None
     try:
         cid = await db.resolve_token(token, is_req)
         if not cid:
-            return BAD_LINK, None, None, None
+            return BAD_LINK, None, None, None, None
 
         original = await db.get_original_link(cid)
         if original:                                  # /genlink wala link
             db.bump_click(cid)
             text = "<b><blockquote>ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ ʟɪɴᴋ:</blockquote></b>" + db.get_brand_footer()
-            return text, [[B(lbl("proceed to link"), url=original)]], None, text + f"\n\n{esc(original)}"
+            return text, [[B(lbl("proceed to link"), url=original)]], None, text + f"\n\n{esc(original)}", None
 
         link, expiry = await get_invite(cid, is_req)
         db.bump_click(cid)
         btn = lbl("request to join") if is_req else lbl("join channel")
-        text = ("<b><blockquote>ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ ʟɪɴᴋ:</blockquote></b>\n"
-                f"<b><blockquote><u>ɴᴏᴛᴇ: ᴛʜɪs ʟɪɴᴋ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴇxᴘɪʀᴇ ɪɴ {sc(_mins(expiry))}.</u></blockquote></b>"
+        text = "<b><blockquote>ᴄʟɪᴄᴋ ʙᴇʟᴏᴡ ᴛᴏ ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ ʟɪɴᴋ:</blockquote></b>"
+        note = (f"<b><blockquote><u>ɴᴏᴛᴇ: ᴛʜɪs ʟɪɴᴋ ᴡɪʟʟ ᴀᴜᴛᴏ-ᴇxᴘɪʀᴇ ɪɴ {sc(_mins(expiry))}.</u></blockquote></b>"
                 + db.get_brand_footer())
-        return text, [[B(btn, url=link)]], expiry, None
+        return text, [[B(btn, url=link)]], expiry, None, note          # note button ke neeche alag message me jaata hai
     except TgError as e:
         print(f"deliver error: {e}")
         if not e.user_gone and (e.chat_gone or e.no_rights or e.code == 400):
@@ -232,10 +237,10 @@ async def build_delivery(payload):
                 await ui.notify_owner(f"⚠️ <b>Link nahi ban pa raha</b>\n<blockquote>{esc(hf.chat_title(cid))} "
                                       f"(<code>{cid}</code>)\n{esc(e.desc[:120])}</blockquote>\n"
                                       "Bot ko channel me admin banao (Invite Users via Link right).")
-        return BAD_LINK, None, None, None
+        return BAD_LINK, None, None, None, None
     except Exception as e:      # noqa
         print(f"deliver error: {type(e).__name__}: {e}")
-        return BAD_LINK, None, None, None
+        return BAD_LINK, None, None, None, None
 
 
 # ================================================================ buttons (public)

@@ -5,9 +5,9 @@ Pehle jo bhi command the (addch, fsub, reqtime, broadcast...) ab sab yahin ke bu
 import config
 import helper_func as hf
 import ui
-from bot import route, clear_state
+from bot import route, clear_state, prompt, on_input, answer_input
 from database.database import db
-from database import tgbackup
+from database import backup as tgbackup, mongosync
 from ui import B, lbl, esc
 
 EXPIRY_CHOICES = [60, 180, 300, 600, 900, 1800, 3600]
@@ -98,29 +98,61 @@ async def cb_settings(cb, parts):
 def _channels_block():
     chans = tgbackup.channel_lines()
     if not chans:
-        return "• <b>ᴄʜᴀɴɴᴇʟ:</b> <code>NOT SET</code>\n"
-    if len(chans) == 1:
-        return f"• <b>ᴄʜᴀɴɴᴇʟ:</b> <code>{chans[0][0]}</code>\n"
-    return "• <b>ᴄʜᴀɴɴᴇʟs:</b>\n" + "".join(f"   {i}. <code>{cid}</code> — {esc(st)}\n" for i, (cid, st) in enumerate(chans, 1))
+        return "• <b>sᴛᴏʀᴀɢᴇ:</b> <code>NOT SET</code>\n"
+    return "• <b>sᴛᴏʀᴀɢᴇ:</b>\n" + "".join(f"   {i}. <code>{esc(str(cid))}</code> — {esc(st)}\n" for i, (cid, st) in enumerate(chans, 1))
 
 
 def backup_view(note=""):
-    text = ("<b>›› 💾 ʙᴀᴄᴋᴜᴘ (ᴛᴇʟᴇɢʀᴀᴍ ᴄʜᴀɴɴᴇʟ)</b>\n\n"
+    text = ("<b>›› 💾 ʙᴀᴄᴋᴜᴘ</b>\n\n"
             "<blockquote>"
             f"{_channels_block()}"
             f"• <b>sᴛᴀᴛᴜs:</b> {esc(tgbackup.status())}\n"
             f"• <b>ʟᴏᴄᴀʟ ᴅʙ:</b> <code>{db.size_kb()} KB</code>"
             "</blockquote>\n"
-            "<i>ɪᴍᴘᴏʀᴛᴀɴᴛ ᴄʜᴀɴɢᴇs ᴀʀᴇ sᴀᴠᴇᴅ ɪɴ ~10 sᴇᴄ, ᴍɪɴᴏʀ ᴏɴᴇs (ᴜsᴇʀs, ᴄʟɪᴄᴋs) ᴇᴠᴇʀʏ ~4 ᴍɪɴ.</i>")
+            "<i>ɪᴍᴘᴏʀᴛᴀɴᴛ ᴄʜᴀɴɢᴇs ᴀʀᴇ sᴀᴠᴇᴅ ɪɴ ~20 sᴇᴄ, ᴜsᴇʀs ᴀʀᴇ sᴀᴠᴇᴅ ᴇᴠᴇʀʏ ~15 sᴇᴄ. ɴᴇᴡ ᴜsᴇʀs ɢᴏ ᴛᴏ ᴛʜᴇ ᴏᴘᴇɴ ᴍᴏɴɢᴏ, ᴀɴᴅ ᴍᴏᴠᴇ ᴛᴏ ᴛʜᴇ ɴᴇxᴛ ᴏɴᴇ ᴡʜᴇɴ ɪᴛ ꜰɪʟʟs.</i>")
     if note:
         text += f"\n\n<blockquote>{note}</blockquote>"
     rows = [[B(lbl("backup now", "💾"), cb="a:bk:N")],
             [B(lbl("download copy", "📥"), cb="a:bk:C")],
             [B(lbl("restore", "♻️"), cb="a:bk:R")]]
+    if config.STORE_ON:
+        rows.append([B(lbl("add mongo", "🍃"), cb="a:bk:MA"), B(lbl("mongo list", "🗂"), cb="a:bk:ML")])
     if config.DB_URI or config.EXTRA_DB_URIS:
         rows.append([B(lbl("import mongo", "🚚"), cb="a:bk:M")])
     rows.append([ui.back_btn("a:home")])
     return text, rows
+
+
+def mongo_list_view(note=""):
+    infos = mongosync.clusters_info()
+    text = "<b>›› 🍃 ᴍᴏɴɢᴏ ʟɪsᴛ</b>\n\n<blockquote>"
+    if not infos:
+        text += "Koi Mongo nahi jura (Render env DB_URI / EXTRA_DB_URIS ya <b>Add Mongo</b>)."
+    for n, i in enumerate(infos, 1):
+        tag = "env" if i["src"] == "env" else "bot"
+        text += (f"{n}. <code>{esc(i['label'])}</code> [{tag}]\n   {esc(i['status'])} · {i['used_mb']}/{config.STORE_LIMIT_MB} MB · "
+                 f"{i['users']} rows\n")
+    text += f"\n<b>Pending:</b> <code>{mongosync.STATE['pending']}</code> (abhi Mongo me jaana baaki)</blockquote>"
+    if note:
+        text += f"\n\n<blockquote>{note}</blockquote>"
+    rows = [[B(lbl(f"remove {n}", "🗑️"), cb=f"a:bk:MD:{i['id']}")] for n, i in enumerate(infos, 1) if i["src"] == "bot"]
+    rows.append([B(lbl("add mongo", "🍃"), cb="a:bk:MA")])
+    rows.append([ui.back_btn("a:bk:V")])
+    return text, rows
+
+
+@on_input("addmongo")
+async def in_addmongo(m, st):
+    if not hf.is_owner(m["from"]["id"]):
+        return
+    uri = (m.get("text") or "").strip()
+    if not uri:
+        return await answer_input(m, st, "<b>⚠️ Mongo URI text me bhejo.</b>", [[B(lbl("cancel", "✖️"), cb=st["back"])]], keep_state=True)
+    ok, info = await mongosync.add_cluster(uri)
+    if not ok:
+        return await answer_input(m, st, f"<b>❌ {esc(info)}</b>", [[B(lbl("cancel", "✖️"), cb=st["back"])]], keep_state=True)
+    text, rows = mongo_list_view("✅ " + esc(info))
+    await answer_input(m, st, text, rows)
 
 
 @route("a:bk", owner=True, late=True)
@@ -150,6 +182,25 @@ async def cb_backup(cb, parts):
         await ui.answer(cb["id"], "⏳ Restore ho raha hai...")
         ok, info = await tgbackup.restore_now()
         note = ("✅ " if ok else "❌ ") + esc(info)
+    elif act == "MA":
+        await ui.answer(cb["id"])
+        return await prompt(cb, "addmongo",
+                            "<b>›› 🍃 ᴀᴅᴅ ᴍᴏɴɢᴏ</b>\n\n<blockquote>Naye MongoDB ki connection string bhejo "
+                            "(<code>mongodb+srv://user:pass@cluster0.xxxx.mongodb.net/</code>).\n"
+                            "Mera is chat me bheja message turant hata diya jayega. Atlas me <b>Network Access → 0.0.0.0/0</b> "
+                            "aur user ko <b>read &amp; write</b> do.</blockquote>", "a:bk:V")
+    elif act == "ML":
+        await ui.answer(cb["id"])
+        return await ui.show(msg, *mongo_list_view())
+    elif act == "MD":
+        await ui.answer(cb["id"])
+        return await ui.show(msg, "<b>›› 🗑️ ʀᴇᴍᴏᴠᴇ ᴍᴏɴɢᴏ?</b>\n\n<blockquote>Is Mongo ke users baaki Mongo me dobara save honge. "
+                                  "Jab tak <b>pending 0</b> na ho bot restart mat karna. Pakka hatana hai?</blockquote>",
+                             ui.confirm_rows(f"a:bk:MDY:{parts[3]}", "a:bk:ML", "yes, remove"))
+    elif act == "MDY":
+        await ui.answer(cb["id"])
+        ok, info = await mongosync.remove_cluster(parts[3])
+        return await ui.show(msg, *mongo_list_view(("✅ " if ok else "❌ ") + esc(info)))
     elif act == "M":
         await ui.answer(cb["id"], "⏳ Mongo se copy ho raha hai...")
         from database import migrate_mongo

@@ -13,7 +13,7 @@ import aiohttp
 import bot
 import config
 import ui
-from database import migrate_mongo, tgbackup
+from database import migrate_mongo, mongosync, backup as tgbackup
 from database.database import db
 from ui import TgError
 
@@ -123,7 +123,7 @@ async def main():
     me = await ui.init()
     print(f"bot: @{me.get('username')}")
 
-    if config.BACKUP_CHANNEL and config.START_WAIT:
+    if (config.BACKUP_CHANNEL or mongosync.enabled()) and config.START_WAIT:
         # deploy ke time purana instance abhi chal raha hota hai aur band hote waqt aakhri backup leta hai.
         print(f"{config.START_WAIT}s ruk raha hoon taaki purane instance ka aakhri backup aa jaye...")
         await asyncio.sleep(config.START_WAIT)
@@ -164,10 +164,10 @@ async def main():
             f"👥 <b>ᴜsᴇʀs:</b> <code>{tot}</code>  📺 <b>ᴄʜᴀɴɴᴇʟs:</b> <code>{len(db.channels)}</code>  "
             f"📢 <b>ꜰsᴜʙ:</b> <code>{len(db.fsub)}</code>\n"
             f"💾 <b>ʙᴀᴄᴋᴜᴘ:</b> {ui.esc(tgbackup.status())}</blockquote>")
-    if not config.BACKUP_CHANNEL:
-        note += "\n<blockquote>⚠️ BACKUP_CHANNEL set nahi hai — restart par naya data ud jayega!</blockquote>"
+    if not tgbackup.configured():
+        note += "\n<blockquote>⚠️ Na Mongo (DB_URI) na BACKUP_CHANNEL set hai — restart par naya data ud jayega!</blockquote>"
     elif not tgbackup.STATE["verified"]:
-        note += f"\n<blockquote>⚠️ Backup channel check nahi ho paya: {ui.esc(restore_msg[:150])}</blockquote>"
+        note += f"\n<blockquote>⚠️ Backup (Mongo / channel) check nahi ho paya: {ui.esc(restore_msg[:150])}</blockquote>"
     if mig_report:
         note += f"\n<blockquote>🚚 {ui.esc(mig_report)}</blockquote>"
     await ui.notify_owner(note, [[ui.B(ui.lbl("admin panel", "👑"), cb="a:home")]])
@@ -185,7 +185,7 @@ async def main():
         print(f"drained {n} jobs")
         await db.flush()
         if tgbackup.STATE["verified"]:
-            await tgbackup.backup_now(force=True)
+            await asyncio.wait_for(tgbackup.backup_now(force=True), 25)      # Render ~30 sec deta hai band hone me
     except Exception as e:      # noqa
         print(f"shutdown error: {e}")
     for t in bg:

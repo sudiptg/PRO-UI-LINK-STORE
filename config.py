@@ -56,7 +56,17 @@ for _env_uri in os.environ.get("EXTRA_DB_URIS", "").split():
     if _env_uri.strip() and _env_uri.strip() not in EXTRA_DB_URIS:
         EXTRA_DB_URIS.append(_env_uri.strip())
 
-# Local DB file (Render par restart me mit jati hai, isliye BACKUP_CHANNEL zaroori hai)
+# ==========================================
+# 🍃 MONGO STORE: bot ka data kai MongoDB me surakshit (database/mongosync.py)
+#   DB_URI + EXTRA_DB_URIS (Render env, space se alag) apne aap storage bante hain; aur chaaho to Admin Panel -> Backup -> Add Mongo.
+#   MONGO_STORE=off  => band.   MONGO_LIMIT_MB = ek Mongo me itna bharne ke baad agla Mongo (free Atlas = 512 MB).
+#   STORE_DB_NAME = Mongo me kis database ke andar (collections 'ls_...' naam ke, purane data se kabhi nahi takraate).
+# ==========================================
+STORE_ON = os.environ.get("MONGO_STORE", "on").strip().lower() != "off"
+STORE_DB = os.environ.get("STORE_DB_NAME", "") or DB_NAME
+STORE_LIMIT_MB = _i("MONGO_LIMIT_MB", 450)
+
+# Local DB file (Render par restart me mit jati hai, isliye Mongo ya BACKUP_CHANNEL zaroori hai)
 import tempfile
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(tempfile.gettempdir(), "linkstore.db")
 BACKUP_EVERY = _i("BACKUP_EVERY", 240)     # sec (users/stats jaise chhote badlav)
@@ -177,7 +187,7 @@ def check():
         problems.append("OWNER_ID missing")
     if problems:
         raise SystemExit("❌ " + " | ".join(problems) + "  (Render > Environment me daalo)")
-    if not BACKUP_CHANNEL:
-        print("⚠️  BACKUP_CHANNEL set nahi hai: Render restart par naya data mit jayega (sirf purana Mongo data wapas aayega)!")
+    if not BACKUP_CHANNEL and not (STORE_ON and (DB_URI or EXTRA_DB_URIS)):
+        print("⚠️  Na BACKUP_CHANNEL hai na Mongo (DB_URI): Render restart par naya data mit jayega!")
     if not LINK_SALT:
         print("⚠️  DB_URI / LINK_SALT khali hai: purane links nahi chalenge (naye links banenge).")

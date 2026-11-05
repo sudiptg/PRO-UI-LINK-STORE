@@ -5,6 +5,9 @@ Render free par disk restart / deploy par mit jati hai. Isliye:
   - Zaroori badlav (channel add, setting, admin...) ~10 sec me channel me save.
   - Chhote badlav (naye users, clicks) har BACKUP_EVERY sec me.
   - DB ki compressed file har channel me EK hi message me update hoti hai (naya message nahi banta) aur PIN rehta hai.
+  - DB 15 MB (compressed) se bada ho jaye to apne aap kai HISSON me bant jaata hai (har hissa apne message me, wahi
+    edit hota hai - naye message nahi bante). Pinned pehle hisse ke caption me baaki hisson ki pehchaan + sha rehti hai,
+    restore me sab jodkar sha se jaanch hoti hai. Max 6 hisse (~90 MB, ~ 1 crore user).
   - EK SE ZYADA channel (BACKUP_CHANNEL=-100a,-100b): har channel me poori copy. Ek channel ud jaye / bot hat jaye
     to bhi doosre me data safe. Restore ke waqt sabse NAYA backup liya jata hai.
   - Bot start hote hi pinned backup dekhta hai aur local se naya ho to restore karta hai.
@@ -12,6 +15,7 @@ Render free par disk restart / deploy par mit jati hai. Isliye:
 """
 import asyncio
 import gzip
+import hashlib
 import os
 import re
 import sqlite3
@@ -24,9 +28,12 @@ from database.database import db, local_last_write, restore_file
 from ui import TgError
 
 # STATE: sabka saar (panel / main isi ko padhte hain)    CH: har channel ki apni halat
-STATE = {"msg_id": 0, "last": 0, "ok": None, "err": "", "size": 0, "verified": False}
+STATE = {"msg_id": 0, "last": 0, "ok": None, "err": "", "size": 0, "verified": False, "parts": 1}
 CH = {}
-MAX_BYTES = 19 * 1024 * 1024          # Bot API 20 MB se badi file download nahi karne deta
+PART_BYTES = 15 * 1024 * 1024         # ek hissa (Bot API 20 MB se badi file download nahi karne deta)
+MAX_PARTS = 6                         # caption me baaki hisson ki file_id aati hain (1024 akshar ki seema)
+MAX_BYTES = PART_BYTES * MAX_PARTS
+_NOTE = {"n": 1}                      # owner ko kitne hisson tak bata chuke
 MIN_GAP = 8                           # do backup ke beech kam se kam itne second
 RETRY_FAILED = 300                    # fail hue channel ko itne second baad dobara try
 _lock = None
@@ -35,7 +42,7 @@ NAME = "linkstore.db.gz"
 
 def _ch(cid):
     return CH.setdefault(cid, {"msg_id": 0, "ts": 0, "seq": 0, "verified": False, "ok": None, "err": "", "last": 0,
-                               "size": 0, "tried": 0})
+                               "size": 0, "tried": 0, "parts": []})
 
 
 def _sync():
@@ -46,6 +53,7 @@ def _sync():
     done = [c for c in chs if c["ok"] is not None]
     STATE["last"] = max([c["last"] for c in chs] or [0])
     STATE["size"] = max([c["size"] for c in chs] or [0])
+    STATE["parts"] = max([1 + len(c.get("parts") or []) for c in chs] or [1])
     if not done:
         STATE["ok"], STATE["err"] = None, ""
     else:
@@ -65,6 +73,25 @@ def _seq_of(caption):
     return int(m.group(1)) if m else 0
 
 
+def _extra_of(caption):
+    """Multi-part backup ka pehle hisse ke caption se: {'n','mids','fids','sha'} ya None (ek hi hissa)."""
+    cap = caption or ""
+    m = re.search(r"parts=(\d+)", cap)
+    if not m or int(m.group(1)) < 2:
+        return None
+    mids = re.search(r"mids=([\d,]*)", cap)
+    fids = re.search(r"fids=([\w\-,]*)", cap)
+    sha = re.search(r"sha=([0-9a-f]+)", cap)
+    return {"n": int(m.group(1)),
+            "mids": [int(x) for x in (mids.group(1).split(",") if mids else []) if x],
+            "fids": [x for x in (fids.group(1).split(",") if fids else []) if x],
+            "sha": sha.group(1) if sha else ""}
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 SEQ = {"n": 0}          # har upload ka badhta number: ek hi second me 2 copy hon to bhi pata chale kaunsi nayi hai
 
 
@@ -82,7 +109,7 @@ async def _find_remote(cid):
     if not doc:
         return None
     cap = pm.get("caption")
-    return pm["message_id"], doc["file_id"], _ts_of(cap), _seq_of(cap)
+    return pm["message_id"], doc["file_id"], _ts_of(cap), _seq_of(cap), _extra_of(cap)
 
 
 async def _inspect():
@@ -96,6 +123,22 @@ async def _inspect():
             return cid, None, f"{type(e).__name__}"
     got = await asyncio.gather(*(one(c) for c in config.BACKUP_CHANNELS))
     return [(c, r) for c, r, e in got if e is None], [(c, e) for c, r, e in got if e is not None]
+
+
+async def _fetch(file_id, extra=None):
+    """Backup ki poori file: ek hissa ho to seedhi, kai hisse ho to sab download karke jodo aur sha se jaancho."""
+    data = await ui.download_file(file_id)
+    if not extra:
+        return data
+    if len(extra["fids"]) != extra["n"] - 1:
+        raise RuntimeError("backup ke hisse adhoore hain")
+    chunks = [data]
+    for fid in extra["fids"]:
+        chunks.append(await ui.download_file(fid))
+    data = b"".join(chunks)
+    if extra["sha"] and _sha(data) != extra["sha"]:
+        raise RuntimeError("backup ke hisson ka mel nahi (upload beech me ruka tha)")
+    return data
 
 
 def _valid(data):
@@ -135,6 +178,8 @@ async def restore_if_needed():
         c["msg_id"] = remote[0] if remote else 0
         c["ts"] = remote[2] if remote else 0
         c["seq"] = remote[3] if remote else 0
+        c["parts"] = list(remote[4]["mids"]) if remote and remote[4] else []
+        _NOTE["n"] = max(_NOTE["n"], 1 + len(c["parts"]))
     SEQ["n"] = max([SEQ["n"]] + [r[3] for _c, r in found if r])
     cands = sorted([((r[2], r[3]), cid, r) for cid, r in found if r], reverse=True)
     lts = local_last_write()
@@ -150,9 +195,9 @@ async def restore_if_needed():
     if lts and lts >= cands[0][0][0]:
         verify_all()
         return f"local db is up to date (local {lts} >= backup {cands[0][0][0]})"
-    for (rts, _sq), cid, (msg_id, file_id, _t, _s) in cands:       # sabse naya pehle, kharab ho to agla
+    for (rts, _sq), cid, (msg_id, file_id, _t, _s, extra) in cands:       # sabse naya pehle, kharab ho to agla
         try:
-            data = await ui.download_file(file_id)
+            data = await _fetch(file_id, extra)
             ok = restore_file(data)
         except Exception as e:      # noqa
             print(f"restore from {cid} failed: {type(e).__name__}: {e}")
@@ -174,9 +219,9 @@ async def restore_now():
     if not cands:
         return False, "channel me koi backup nahi mila" if found else "channel(s) nahi mile (bot admin hai?)"
     last_err = ""
-    for (rts, _sq), cid, (msg_id, file_id, _t, _s) in cands:
+    for (rts, _sq), cid, (msg_id, file_id, _t, _s, extra) in cands:
         try:
-            data = await ui.download_file(file_id)
+            data = await _fetch(file_id, extra)
         except Exception as e:      # noqa
             last_err = f"download fail: {e}"
             continue
@@ -191,7 +236,8 @@ async def restore_now():
             last_err = "restore fail (purana data wapas chalu)"
             continue
         for c, r in found:
-            _ch(c).update(verified=True, msg_id=r[0] if r else 0, ts=r[2] if r else 0, seq=r[3] if r else 0)
+            _ch(c).update(verified=True, msg_id=r[0] if r else 0, ts=r[2] if r else 0, seq=r[3] if r else 0,
+                          parts=list(r[4]["mids"]) if r and r[4] else [])
         STATE["last"] = rts
         _sync()
         return True, f"restore ho gaya (backup ts={rts})"
@@ -205,15 +251,57 @@ def _get_lock():
     return _lock
 
 
-async def _push(cid, data, cap, seq=0):
-    """Ek channel me file update (edit) ya nayi bhejo + pin. True/False."""
+def _doc_of(res):
+    d = (res or {}).get("document") if isinstance(res, dict) else None
+    if not d or not d.get("file_id"):
+        raise RuntimeError("Telegram ne file_id nahi diya")
+    return d["file_id"]
+
+
+async def _put_part(cid, mid, name, chunk, cap):
+    """Baaki (2..n) hisse ka message: purana ho to usi ko edit, warna naya. -> (message_id, file_id). Pin nahi hota."""
+    if mid:
+        try:
+            res = await ui.edit_document(cid, mid, name, chunk, cap)
+            return mid, _doc_of(res)
+        except (TgError, RuntimeError) as e:
+            print(f"backup part edit failed ({cid}), sending new: {e}")
+    m = await ui.send_document(cid, name, chunk, cap)
+    fid = _doc_of(m)
+    if mid:
+        await ui.delete(cid, mid)
+    return m["message_id"], fid
+
+
+async def _push(cid, data, base_cap, seq=0):
+    """Ek channel me backup: ek hissa ho to seedha, kai ho to pehle baaki hisse phir pinned pehla hissa (caption me jodne ki jaankari).
+    True/False."""
     c = _ch(cid)
     c["tried"] = time.time()
     try:
+        n = max(1, -(-len(data) // PART_BYTES))
+        if n > MAX_PARTS:
+            raise RuntimeError(f"backup too big ({len(data) // 1024} KB)")
+        old_extra = list(c.get("parts") or [])
+        mids, fids = [], []
+        for i in range(1, n):                                    # hissa 2..n pehle (head sabse aakhir me)
+            chunk = data[i * PART_BYTES:(i + 1) * PART_BYTES]
+            part_cap = f"link-store backup part {i + 1}/{n} | seq={seq} | do not delete"
+            mid, fid = await _put_part(cid, old_extra[i - 1] if i - 1 < len(old_extra) else 0,
+                                       f"{NAME}.{i + 1:03d}", chunk, part_cap)
+            mids.append(mid)
+            fids.append(fid)
+        if n == 1:
+            cap, head, head_name = base_cap, data, NAME
+        else:
+            cap = f"{base_cap} | parts={n} | mids={','.join(map(str, mids))} | fids={','.join(fids)} | sha={_sha(data)}"
+            head, head_name = data[:PART_BYTES], f"{NAME}.001"
+            if len(cap) > 1024:
+                raise RuntimeError("backup caption too long")
         done = False
         if c["msg_id"]:
             try:
-                await ui.edit_document(cid, c["msg_id"], NAME, data, cap)
+                await ui.edit_document(cid, c["msg_id"], head_name, head, cap)
                 done = True
             except TgError as e:
                 if e.not_modified:
@@ -221,7 +309,7 @@ async def _push(cid, data, cap, seq=0):
                 else:
                     print(f"backup edit failed ({cid}), sending new: {e}")
         if not done:
-            m = await ui.send_document(cid, NAME, data, cap)
+            m = await ui.send_document(cid, head_name, head, cap)
             old = c["msg_id"]
             c["msg_id"] = m["message_id"]
             try:
@@ -231,7 +319,9 @@ async def _push(cid, data, cap, seq=0):
                 print(f"pin failed ({cid}) (bot ko Pin/Edit right do): {e}")
             if old:
                 await ui.delete(cid, old)
-        c.update(ok=True, err="", last=int(time.time()), size=len(data) // 1024, seq=seq)
+        for mid in old_extra[len(mids):]:                        # DB chhota ho gaya: faltu purane hisse hata do
+            await ui.delete(cid, mid)
+        c.update(ok=True, err="", last=int(time.time()), size=len(data) // 1024, seq=seq, parts=mids)
         return True
     except Exception as e:        # noqa
         c.update(ok=False, err=f"{type(e).__name__}: {e}"[:120])
@@ -267,7 +357,23 @@ async def _backup(chs, force=False, mark_clean=True):
         if not any(res) and mark_clean:
             db.touch(True)                     # kisi me nahi gaya: baad me fir koshish
         _sync()
+        await _size_notice()
         return any(res)
+
+
+async def _size_notice():
+    """DB bada hone par owner ko (har naye stage par ek baar) batao."""
+    n = STATE["parts"]
+    if n <= _NOTE["n"] or n < 2:
+        return
+    _NOTE["n"] = n
+    try:
+        warn = ("\n⚠️ <b>Ab limit ke paas ho</b> - ab purane/mare hue users saaf karo ya mujhe batao." if n >= MAX_PARTS - 1 else "")
+        await ui.notify_owner(f"💾 <b>Backup ab {n} hisson me hai</b> ({STATE['size'] // 1024} MB)\n"
+                              f"<blockquote>Data bada ho gaya, isliye backup apne aap {n} hisson me bant gaya. "
+                              f"Kuch karne ki zaroorat nahi. Max {MAX_PARTS} hisse.</blockquote>{warn}")
+    except Exception as e:      # noqa
+        print(f"size notice: {e}")
 
 
 async def backup_now(force=False):
@@ -285,7 +391,14 @@ async def backup_now(force=False):
 async def send_copy_to(chat_id):
     """Backup file ki ek copy kisi ko (owner ke DM me) bhejo."""
     data = await db.snapshot_gz()
-    return await ui.send_document(chat_id, NAME, data, "💾 link-store backup copy (safe jagah rakho)")
+    n = max(1, -(-len(data) // PART_BYTES))
+    if n == 1:
+        return await ui.send_document(chat_id, NAME, data, "💾 link-store backup copy (safe jagah rakho)")
+    res = None
+    for i in range(n):                                  # Bot API 50 MB se badi file nahi bhejne deta
+        res = await ui.send_document(chat_id, f"{NAME}.{i + 1:03d}", data[i * PART_BYTES:(i + 1) * PART_BYTES],
+                                     f"💾 link-store backup copy - hissa {i + 1}/{n} (sab hisse safe rakho, kram se jodna)")
+    return res
 
 
 def channel_lines():
@@ -321,7 +434,8 @@ def status():
     when = f"{ago}s ago" if ago < 120 else f"{ago // 60}m ago"
     extra = f" · {okc}/{n} channels" if n > 1 else ""
     warn = " ⚠️" if okc < n else ""
-    return f"✅ {when} ({STATE['size']} KB){extra}{warn}"
+    parts = f" · {STATE['parts']} parts" if STATE["parts"] > 1 else ""
+    return f"✅ {when} ({STATE['size']} KB{parts}){extra}{warn}"
 
 
 async def _verify_late(cid):
@@ -333,18 +447,18 @@ async def _verify_late(cid):
         c.update(ok=False, err=f"channel nahi mila: {str(e.desc)[:60]}")
         return
     if not remote:
-        c.update(verified=True, ok=None, err="", msg_id=0, ts=0, seq=0)
+        c.update(verified=True, ok=None, err="", msg_id=0, ts=0, seq=0, parts=[])
         return
-    msg_id, file_id, rts, _sq = remote
+    msg_id, file_id, rts, _sq, _ex = remote
     SEQ['n'] = max(SEQ['n'], _sq)
     lts = local_last_write()
     if lts and lts >= rts:
-        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts, seq=_sq)
+        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts, seq=_sq, parts=list(_ex["mids"]) if _ex else [])
         return
     ok, msg = await restore_now()                  # channel ka backup local se naya hai
     print(f"late restore: {msg}")
     if ok:
-        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts)
+        c.update(verified=True, ok=None, err="", msg_id=msg_id, ts=rts, parts=list(_ex["mids"]) if _ex else [])
         await ui.notify_owner(f"♻️ <b>Backup channel ab mila</b>: {ui.esc(msg)}")
 
 
@@ -361,15 +475,16 @@ async def loop():
             chs = [c for c in config.BACKUP_CHANNELS if _ch(c)["verified"]]
             now = time.time()
             since = now - (STATE["last"] or 0)
+            k = min(4, max(1, STATE["parts"]))                 # bada backup (kai hisse) kam baar - upload bhaari hota hai
             due = False
             if chs:
                 lw = int(await db.get_meta("last_write", 0) or 0)
                 behind = any(not _ch(c)["msg_id"] or _ch(c)["ts"] < lw or _ch(c)["seq"] < SEQ["n"] for c in chs)
                 if first and behind:
                     due = True
-                elif db.dirty_hi and now - db.dirty_hi >= MIN_GAP and since >= MIN_GAP:
+                elif db.dirty_hi and now - db.dirty_hi >= MIN_GAP * k and since >= MIN_GAP * k:
                     due = True
-                elif db.dirty_lo and since >= config.BACKUP_EVERY:
+                elif db.dirty_lo and since >= config.BACKUP_EVERY * k:
                     due = True
             if due:
                 await backup_now(force=first and behind)

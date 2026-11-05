@@ -12,7 +12,7 @@ import helper_func as hf
 import ui
 from bot import route, on_input, set_state, clear_state, pm_of, _is_msg
 from database.database import db, today
-from database import tgbackup
+from database import backup as tgbackup
 from ui import B, TgError, lbl, esc, bar
 
 _bg = set()                     # background tasks (gc se bachane ke liye)

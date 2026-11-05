@@ -44,17 +44,38 @@ def req_token(cid):
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, ts INTEGER DEFAULT 0, dead INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, ts INTEGER DEFAULT 0, dead INTEGER DEFAULT 0, sh INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS docs(coll TEXT, k TEXT, doc TEXT, PRIMARY KEY(coll, k));
 CREATE TABLE IF NOT EXISTS genlinks(id INTEGER PRIMARY KEY, link TEXT, ts INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, kind TEXT, id INTEGER);
 CREATE INDEX IF NOT EXISTS idx_tokens_id ON tokens(id);
-CREATE TABLE IF NOT EXISTS joinreq(chat_id INTEGER, user_id INTEGER, ts INTEGER DEFAULT 0, PRIMARY KEY(chat_id, user_id));
+CREATE TABLE IF NOT EXISTS joinreq(chat_id INTEGER, user_id INTEGER, ts INTEGER DEFAULT 0, sh INTEGER DEFAULT 0, PRIMARY KEY(chat_id, user_id));
 CREATE TABLE IF NOT EXISTS bans(user_id INTEGER PRIMARY KEY, ts INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS stats(day INTEGER, k TEXT, v INTEGER DEFAULT 0, PRIMARY KEY(day, k));
 CREATE TABLE IF NOT EXISTS clicks(channel_id INTEGER, day INTEGER, n INTEGER DEFAULT 0, PRIMARY KEY(channel_id, day));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
+
+def ensure_schema(conn):
+    """Tables banao + purane DB me nayi 'dead' / 'sh' columns jodo. (sh = Mongo sync: 0 naya, +id synced, -id dobara bhejna hai)"""
+    conn.executescript(SCHEMA)
+    ucols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    if "dead" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN dead INTEGER DEFAULT 0")
+    if "sh" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN sh INTEGER DEFAULT 0")
+    jcols = [r[1] for r in conn.execute("PRAGMA table_info(joinreq)")]
+    if "sh" not in jcols:
+        conn.execute("ALTER TABLE joinreq ADD COLUMN sh INTEGER DEFAULT 0")
+    if config.STORE_ON and (config.DB_URI or config.EXTRA_DB_URIS):
+        ensure_sync_index(conn)
+
+
+def ensure_sync_index(conn):
+    """Sirf 'abhi Mongo me bheja nahi gaya' wali rows ka chhota index (pending ginna tez). Mongo na ho to nahi banta (backup file chhoti rahe)."""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_unsynced ON users(user_id) WHERE sh<=0")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_joinreq_unsynced ON joinreq(chat_id, user_id) WHERE sh<=0")
+
 
 DEFAULT_SETTINGS = {
     "brand_name": config.DEFAULT_BRAND_NAME,
@@ -95,11 +116,7 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA cache_size=-3000")
-        self.conn.executescript(SCHEMA)
-        # purane (is bot se pehle ke) DB me 'dead' column na ho to jodo
-        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(users)")]
-        if "dead" not in cols:
-            self.conn.execute("ALTER TABLE users ADD COLUMN dead INTEGER DEFAULT 0")
+        ensure_schema(self.conn)
 
     def _load(self):
         c = self.conn
@@ -217,7 +234,7 @@ class DB:
         def _chk(c):
             r = c.execute("SELECT dead FROM users WHERE user_id=?", (uid,)).fetchone()
             if r and r[0]:
-                c.execute("UPDATE users SET dead=0 WHERE user_id=?", (uid,))     # wapas aaya
+                c.execute("UPDATE users SET dead=0, sh=CASE WHEN sh>0 THEN -sh ELSE sh END WHERE user_id=?", (uid,))     # wapas aaya
             return bool(r)
         exists = await self._run(_chk)
         if len(self.seen) > 40000:
@@ -238,7 +255,8 @@ class DB:
 
     async def mark_dead(self, uid, dead=True):
         """User ne bot block kiya / account delete - DELETE nahi, sirf inactive mark."""
-        await self._run(lambda c: c.execute("UPDATE users SET dead=? WHERE user_id=?", (1 if dead else 0, uid)))
+        await self._run(lambda c: c.execute(
+            "UPDATE users SET dead=?, sh=CASE WHEN sh>0 THEN -sh ELSE sh END WHERE user_id=?", (1 if dead else 0, uid)))
         self.touch(False)
 
     async def count_users(self, fresh=False):

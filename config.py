@@ -132,10 +132,11 @@ HELP = os.environ.get(
 ABOUT = os.environ.get(
     "ABOUT_MESSAGE",
     "<blockquote>"
-    "• <b>›› ᴏᴡɴᴇʀ:</b> ꜰʟʏᴛᴏɴ ᴏᴡɴᴇʀ/n"
+    "• <b>›› ᴏᴡɴᴇʀ:</b> ꜰʟʏᴛᴏɴ ᴏᴡɴᴇʀ\n"
     "• <b>›› ʟᴀɴɢᴜᴀɢᴇ:</b> Pʏᴛʜᴏɴ 3\n"
     "• <b>›› ʟɪʙʀᴀʀʏ:</b> Pʏʀᴏɢʀᴀᴍ ᴠ2\n"
-    "• <b>›› ᴅᴇᴠᴇʟᴏᴘᴇʀ:</b> @VyroMax"
+    "• <b>›› ᴅᴀᴛᴀʙᴀsᴇ:</b> Mᴏɴɢᴏ ᴅʙ\n"
+    "• <b>›› ᴅᴇᴠᴇʟᴏᴘᴇʀ:</b> ꜰʟʏᴛᴏɴ ᴀɴɪᴍᴇ"
     "</blockquote>"
 )
 
@@ -143,7 +144,6 @@ ABOUT_TXT = ABOUT
 
 CHANNELS_TXT = os.environ.get(
     "CHANNELS_TXT",
-    "<b>›› 📢 ᴏғғɪᴄɪᴀʟ ɴᴇᴛᴡᴏʀᴋ ᴄʜᴀɴɴᴇʟs :</b>\n\n"
 )
 
 BOT_STATS_TEXT = "<b>⚡ ʙᴏᴛ ᴜᴘᴛɪᴍᴇ :</b> <code>{uptime}</code>"
